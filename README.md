@@ -125,6 +125,16 @@ push anything to Dawarich. It is also available on the `push` command.
 Console output is also appended to `logs/strava-2-dawarich.log` by default.
 Set `LOG_TO_FILE=false` to disable file logging.
 
+### Internal HTTPS certificates
+
+For a Dawarich endpoint signed by a homelab CA, copy only the public root
+certificate to `certs/rootCA.pem`, or set `CUSTOM_CA_PATH` to its host path.
+The container combines it with the public certifi roots, preserving TLS trust
+for both Dawarich and Strava. Never copy the CA private key into the project.
+
+Failed Dawarich uploads remain pending and are retried automatically by the
+next `sync`. A failed upload also causes a non-zero exit code for monitoring.
+
 ## Automating with Cron (Unraid User Scripts)
 
 Add a User Script on Unraid to sync on a schedule:
@@ -136,6 +146,12 @@ python3 strava_gpx.py sync
 ```
 
 Set the schedule (e.g., every 6 hours) in the User Scripts plugin.
+
+On a regular Linux Docker host, the equivalent user crontab entry is:
+
+```cron
+0 */6 * * * cd /opt/stacks/strava-2-dawarich && /usr/bin/flock -n /tmp/strava-2-dawarich.lock /usr/bin/docker compose exec -T strava-2-dawarich python strava_gpx.py sync >> /tank/appdata/strava-2-dawarich/logs/cron.log 2>&1
+```
 
 ## Files
 

@@ -625,11 +625,12 @@ def push_to_dawarich(cfg, gpx_files, dry_run=False):
     """Upload GPX files to Dawarich's import endpoint."""
     if not cfg.get("dawarich_url") or not cfg.get("dawarich_api_key"):
         print("Dawarich not configured. Skipping push.")
-        return
+        return 0
 
     import_url = f"{cfg['dawarich_url']}/api/v1/imports"
     headers = {"Authorization": f"Bearer {cfg['dawarich_api_key']}"}
     uploaded_files = load_import_state()
+    failures = 0
 
     for gpx_path in gpx_files:
         if gpx_path.name in uploaded_files:
@@ -639,18 +640,35 @@ def push_to_dawarich(cfg, gpx_files, dry_run=False):
             print(f"  [dry-run] Would upload {gpx_path.name}")
             continue
         print(f"  Pushing {gpx_path.name}...")
-        with open(gpx_path, "rb") as f:
-            resp = requests.post(
-                import_url,
-                headers=headers,
-                files={"file": (gpx_path.name, f, "application/gpx+xml")},
-            )
+        try:
+            with open(gpx_path, "rb") as f:
+                resp = requests.post(
+                    import_url,
+                    headers=headers,
+                    files={"file": (gpx_path.name, f, "application/gpx+xml")},
+                    timeout=60,
+                )
+        except requests.RequestException as exc:
+            failures += 1
+            print(f"    [ERROR] Network error: {exc}")
+            continue
         if resp.ok:
-            print(f"    ✓ Uploaded")
+            print("    [OK] Uploaded")
             uploaded_files.add(gpx_path.name)
             save_import_state(uploaded_files)
         else:
-            print(f"    ✗ Failed ({resp.status_code}): {resp.text[:200]}")
+            failures += 1
+            print(f"    [ERROR] Failed ({resp.status_code}): {resp.text[:200]}")
+    return failures
+
+
+def pending_gpx_files(gpx_dir=None):
+    """List GPX files not yet recorded as successfully uploaded."""
+    directory = gpx_dir or OUTPUT_DIR
+    if not directory.exists():
+        return []
+    uploaded_files = load_import_state()
+    return [path for path in sorted(directory.glob("*.gpx")) if path.name not in uploaded_files]
 
 
 # ── Main sync logic ─────────────────────────────────────────────────────────
@@ -815,8 +833,14 @@ def main():
 
         gpx_files = sync(cfg, after_timestamp=after, dry_run=args.dry_run)
 
-        if gpx_files and not args.no_push:
-            push_to_dawarich(cfg, gpx_files, dry_run=args.dry_run)
+        if not args.no_push and not args.dry_run:
+            pending_files = pending_gpx_files()
+            if pending_files:
+                print(f"Pushing {len(pending_files)} pending GPX files to Dawarich...")
+                failures = push_to_dawarich(cfg, pending_files)
+                if failures:
+                    print(f"{failures} upload(s) failed and will be retried on the next sync.")
+                    sys.exit(1)
 
         return
 
@@ -826,12 +850,14 @@ def main():
         if not gpx_dir.exists():
             print(f"Directory not found: {gpx_dir}")
             sys.exit(1)
-        gpx_files = sorted(gpx_dir.glob("*.gpx"))
+        gpx_files = pending_gpx_files(gpx_dir)
         if not gpx_files:
-            print("No GPX files found.")
+            print("No pending GPX files found.")
             return
         print(f"Pushing {len(gpx_files)} GPX files to Dawarich...")
-        push_to_dawarich(cfg, gpx_files, dry_run=args.dry_run)
+        failures = push_to_dawarich(cfg, gpx_files, dry_run=args.dry_run)
+        if failures:
+            sys.exit(1)
         return
 
     # No command given

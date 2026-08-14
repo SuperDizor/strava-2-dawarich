@@ -12,9 +12,12 @@ services:
       GPX_DIR: /data/gpx
       LOG_DIR: /data/logs
       STRAVA_CALLBACK_BIND: 0.0.0.0
+      CUSTOM_CA_CERT: /certs/rootCA.pem
+      REQUESTS_CA_BUNDLE: /tmp/combined-ca.pem
     volumes:
       - ${APPDATA_PATH:-./data}/state:/data/state
       - ${APPDATA_PATH:-./data}/gpx:/data/gpx
       - ${APPDATA_PATH:-./data}/logs:/data/logs
+      - ${CUSTOM_CA_PATH:-./certs/rootCA.pem}:/certs/rootCA.pem:ro
     ports:
       - "${STRAVA_CALLBACK_PORT:-8089}:8089"
