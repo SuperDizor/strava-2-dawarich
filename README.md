@@ -147,7 +147,9 @@ docker compose exec strava-2-dawarich \
 ```
 
 Points within `DAWARICH_DEDUP_RADIUS_METERS` (200 meters by default) are listed
-as deletion candidates. JSON reports are written to
+as deletion candidates only when their `tracker_id` is explicitly listed in
+`DAWARICH_DEDUP_TRACKER_IDS` (comma-separated). Imported `gpx-*` points are
+always preserved. JSON reports are written to
 `state/dedup-reports/strava-<activity-id>.json`. This release never sends a
 DELETE request; `--dedup-dawarich` is rejected unless `--dry-run` is also set.
 

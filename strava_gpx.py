@@ -249,7 +249,8 @@ def fetch_dawarich_points(cfg, start_timestamp, end_timestamp):
                 "start_at": start_timestamp,
                 "end_at": end_timestamp,
                 "order": "asc",
-                "slim": "true",
+                # Full representation is required for tracker_id source filtering.
+                "slim": "false",
                 "page": page,
             },
             timeout=60,
@@ -269,16 +270,36 @@ def fetch_dawarich_points(cfg, start_timestamp, end_timestamp):
     return points
 
 
-def analyze_dawarich_overlap(cfg, activity, gpx_xml, radius_meters=200):
+def analyze_dawarich_overlap(
+        cfg, activity, gpx_xml, radius_meters=200, allowed_tracker_ids=None):
     """Read-only analysis of Dawarich points overlapping a Strava activity."""
     start = int(datetime.fromisoformat(activity["start_date"].replace("Z", "+00:00")).timestamp())
     end = start + int(activity.get("elapsed_time", 0))
     track = gpx_coordinates(gpx_xml)
     points = fetch_dawarich_points(cfg, start, end)
+    if allowed_tracker_ids is None:
+        allowed_tracker_ids = {
+            value.strip()
+            for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
+            if value.strip()
+        }
+    else:
+        allowed_tracker_ids = set(allowed_tracker_ids)
     candidates = []
     invalid = 0
+    gpx_preserved = 0
+    unapproved_preserved = 0
+    tracker_summary = {}
 
     for point in points:
+        tracker_id = point.get("tracker_id") or "<none>"
+        tracker_summary[tracker_id] = tracker_summary.get(tracker_id, 0) + 1
+        if tracker_id.startswith("gpx-"):
+            gpx_preserved += 1
+            continue
+        if tracker_id not in allowed_tracker_ids:
+            unapproved_preserved += 1
+            continue
         coordinates = point_coordinates(point)
         if not coordinates or not track:
             invalid += 1
@@ -286,7 +307,11 @@ def analyze_dawarich_overlap(cfg, activity, gpx_xml, radius_meters=200):
         latitude, longitude = coordinates
         nearest = min(haversine_meters(latitude, longitude, lat, lon) for lat, lon in track)
         if nearest <= radius_meters:
-            candidates.append({"id": point.get("id"), "distance_m": round(nearest, 1)})
+            candidates.append({
+                "id": point.get("id"),
+                "tracker_id": tracker_id,
+                "distance_m": round(nearest, 1),
+            })
 
     report = {
         "activity_id": activity["id"],
@@ -294,12 +319,21 @@ def analyze_dawarich_overlap(cfg, activity, gpx_xml, radius_meters=200):
         "start_timestamp": start,
         "end_timestamp": end,
         "radius_meters": radius_meters,
+        "allowed_tracker_ids": sorted(allowed_tracker_ids),
+        "tracker_summary": tracker_summary,
         "dawarich_points": len(points),
         "candidate_points": candidates,
-        "outside_corridor": len(points) - len(candidates) - invalid,
+        "gpx_points_preserved": gpx_preserved,
+        "unapproved_tracker_points_preserved": unapproved_preserved,
+        "outside_corridor": (
+            len(points) - len(candidates) - invalid - gpx_preserved - unapproved_preserved
+        ),
         "invalid_points": invalid,
     }
     print(f"    Dawarich overlap: {len(points)} points in time window")
+    print(f"    Tracker sources: {tracker_summary}")
+    print(f"    GPX points preserved: {gpx_preserved}")
+    print(f"    Unapproved tracker points preserved: {unapproved_preserved}")
     print(f"    Dedup candidates: {len(candidates)} within {radius_meters} m of Strava track")
     print(f"    Preserved: {report['outside_corridor']} outside corridor; {invalid} invalid")
     DEDUP_REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -952,6 +986,9 @@ def main():
             sys.exit(2)
         if args.dedup_dawarich and not cfg.get("dawarich_url"):
             print("Dawarich must be configured for --dedup-dawarich.")
+            sys.exit(2)
+        if args.dedup_dawarich and not os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").strip():
+            print("Set DAWARICH_DEDUP_TRACKER_IDS to the tracker IDs allowed for deduplication.")
             sys.exit(2)
 
         after = None

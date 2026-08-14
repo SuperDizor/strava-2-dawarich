@@ -80,15 +80,21 @@ class DeduplicationTests(unittest.TestCase):
             '</trkseg></trk></gpx>'
         )
         points = [
-            {"id": 1, "lat": 46.8001, "lng": -71.2001},
-            {"id": 2, "lat": 46.9000, "lng": -71.3000},
+            {"id": 1, "lat": 46.8001, "lng": -71.2001, "tracker_id": "D5"},
+            {"id": 2, "lat": 46.9000, "lng": -71.3000, "tracker_id": "D5"},
+            {"id": 3, "lat": 46.8001, "lng": -71.2001, "tracker_id": "gpx-import"},
+            {"id": 4, "lat": 46.8001, "lng": -71.2001, "tracker_id": "OTHER"},
         ]
 
         with patch.object(app, "fetch_dawarich_points", return_value=points):
-            report = app.analyze_dawarich_overlap({}, activity, gpx, radius_meters=200)
+            report = app.analyze_dawarich_overlap(
+                {}, activity, gpx, radius_meters=200, allowed_tracker_ids={"D5"}
+            )
 
         self.assertEqual([point["id"] for point in report["candidate_points"]], [1])
         self.assertEqual(report["outside_corridor"], 1)
+        self.assertEqual(report["gpx_points_preserved"], 1)
+        self.assertEqual(report["unapproved_tracker_points_preserved"], 1)
         self.assertTrue((app.DEDUP_REPORT_DIR / "strava-42.json").exists())
 
     def test_dedup_preview_reexamines_already_fetched_activity(self):
