@@ -135,6 +135,22 @@ for both Dawarich and Strava. Never copy the CA private key into the project.
 Failed Dawarich uploads remain pending and are retried automatically by the
 next `sync`. A failed upload also causes a non-zero exit code for monitoring.
 
+### Dawarich overlap preview
+
+The first deduplication phase is deliberately read-only. It compares Dawarich
+points in each activity's `start_date` to `start_date + elapsed_time` window
+against the generated Strava track:
+
+```bash
+docker compose exec strava-2-dawarich \
+  python strava_gpx.py sync --days 7 --dedup-dawarich --dry-run
+```
+
+Points within `DAWARICH_DEDUP_RADIUS_METERS` (200 meters by default) are listed
+as deletion candidates. JSON reports are written to
+`state/dedup-reports/strava-<activity-id>.json`. This release never sends a
+DELETE request; `--dedup-dawarich` is rejected unless `--dry-run` is also set.
+
 ## Automating with Cron (Unraid User Scripts)
 
 Add a User Script on Unraid to sync on a schedule:

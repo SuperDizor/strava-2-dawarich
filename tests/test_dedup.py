@@ -11,6 +11,7 @@ from unittest.mock import patch
 requests_stub = types.ModuleType("requests")
 requests_stub.RequestException = Exception
 requests_stub.post = lambda *args, **kwargs: None
+requests_stub.get = lambda *args, **kwargs: None
 sys.modules.setdefault("requests", requests_stub)
 
 MODULE_PATH = Path(__file__).parents[1] / "strava_gpx.py"
@@ -26,6 +27,7 @@ class DeduplicationTests(unittest.TestCase):
         app.STATE_DIR = self.root / "state"
         app.OUTPUT_DIR = self.root / "gpx"
         app.IMPORT_STATE_FILE = app.STATE_DIR / "dawarich_imports.json"
+        app.DEDUP_REPORT_DIR = app.STATE_DIR / "dedup-reports"
         app.OUTPUT_DIR.mkdir()
 
     def tearDown(self):
@@ -63,6 +65,31 @@ class DeduplicationTests(unittest.TestCase):
         state = json.loads(app.IMPORT_STATE_FILE.read_text(encoding="utf-8"))
         self.assertEqual(failures, 0)
         self.assertEqual(state["uploaded_files"], [pending.name])
+
+    def test_overlap_preview_selects_only_points_inside_corridor(self):
+        activity = {
+            "id": 42,
+            "name": "Test Ride",
+            "start_date": "2026-08-14T12:00:00Z",
+            "elapsed_time": 3600,
+        }
+        gpx = (
+            '<gpx><trk><trkseg>'
+            '<trkpt lat="46.8000" lon="-71.2000" />'
+            '<trkpt lat="46.8010" lon="-71.2010" />'
+            '</trkseg></trk></gpx>'
+        )
+        points = [
+            {"id": 1, "lat": 46.8001, "lng": -71.2001},
+            {"id": 2, "lat": 46.9000, "lng": -71.3000},
+        ]
+
+        with patch.object(app, "fetch_dawarich_points", return_value=points):
+            report = app.analyze_dawarich_overlap({}, activity, gpx, radius_meters=200)
+
+        self.assertEqual([point["id"] for point in report["candidate_points"]], [1])
+        self.assertEqual(report["outside_corridor"], 1)
+        self.assertTrue((app.DEDUP_REPORT_DIR / "strava-42.json").exists())
 
 
 if __name__ == "__main__":
