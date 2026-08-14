@@ -21,10 +21,14 @@ VERSION = "1.0.0"
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 ENV_FILE = SCRIPT_DIR / ".env"
-CONFIG_FILE = SCRIPT_DIR / "config.json"
-STATE_FILE = SCRIPT_DIR / "state.json"
-TOKEN_FILE = SCRIPT_DIR / "token.json"
-OUTPUT_DIR = SCRIPT_DIR / "gpx_output"
+DATA_DIR = Path(os.environ.get("DATA_DIR", SCRIPT_DIR)).resolve()
+STATE_DIR = Path(os.environ.get("STATE_DIR", DATA_DIR)).resolve()
+OUTPUT_DIR = Path(os.environ.get("GPX_DIR", DATA_DIR / "gpx_output")).resolve()
+LOG_DIR = Path(os.environ.get("LOG_DIR", DATA_DIR / "logs")).resolve()
+CONFIG_FILE = STATE_DIR / "config.json"
+STATE_FILE = STATE_DIR / "state.json"
+TOKEN_FILE = STATE_DIR / "token.json"
+IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
 
 STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
@@ -32,6 +36,7 @@ STRAVA_API_BASE = "https://www.strava.com/api/v3"
 
 REDIRECT_PORT = 8089
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/callback"
+REDIRECT_BIND = os.environ.get("STRAVA_CALLBACK_BIND", "0.0.0.0")
 
 # Activity types that never have GPS data — skip without hitting the streams API
 NO_GPS_TYPES = {
@@ -41,6 +46,48 @@ NO_GPS_TYPES = {
 
 # Virtual activity types — GPS is from a virtual world, not the real location
 VIRTUAL_TYPES = {"VirtualRide", "VirtualRun"}
+
+
+def configure_runtime_paths():
+    """Refresh storage paths after values from .env have been loaded."""
+    global DATA_DIR, STATE_DIR, OUTPUT_DIR, LOG_DIR
+    global CONFIG_FILE, STATE_FILE, TOKEN_FILE, IMPORT_STATE_FILE
+    DATA_DIR = Path(os.environ.get("DATA_DIR", SCRIPT_DIR)).resolve()
+    STATE_DIR = Path(os.environ.get("STATE_DIR", DATA_DIR)).resolve()
+    OUTPUT_DIR = Path(os.environ.get("GPX_DIR", DATA_DIR / "gpx_output")).resolve()
+    LOG_DIR = Path(os.environ.get("LOG_DIR", DATA_DIR / "logs")).resolve()
+    CONFIG_FILE = STATE_DIR / "config.json"
+    STATE_FILE = STATE_DIR / "state.json"
+    TOKEN_FILE = STATE_DIR / "token.json"
+    IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
+
+
+class TeeStream:
+    """Write console output to both the terminal and a persistent log."""
+
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    def write(self, data):
+        self.terminal.write(data)
+        self.log_file.write(data)
+        self.log_file.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+
+
+def setup_logging():
+    load_dotenv()
+    configure_runtime_paths()
+    if os.environ.get("LOG_TO_FILE", "true").lower() not in {"1", "true", "yes"}:
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = open(LOG_DIR / "strava-2-dawarich.log", "a", encoding="utf-8")
+    sys.stdout = TeeStream(sys.stdout, log_file)
+    sys.stderr = TeeStream(sys.stderr, log_file)
 
 
 # ── .env loader (no external deps) ──────────────────────────────────────────
@@ -67,6 +114,7 @@ def load_dotenv():
 def load_config():
     """Load config from .env (preferred), then config.json, else exit."""
     load_dotenv()
+    configure_runtime_paths()
 
     # Check env vars first
     client_id = os.environ.get("STRAVA_CLIENT_ID", "")
@@ -92,6 +140,7 @@ def load_config():
 
 
 def save_config(cfg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
 
@@ -129,8 +178,23 @@ def load_state():
 
 
 def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def load_import_state():
+    """Return filenames already accepted by Dawarich."""
+    if IMPORT_STATE_FILE.exists():
+        with open(IMPORT_STATE_FILE) as f:
+            return set(json.load(f).get("uploaded_files", []))
+    return set()
+
+
+def save_import_state(uploaded_files):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(IMPORT_STATE_FILE, "w") as f:
+        json.dump({"uploaded_files": sorted(uploaded_files)}, f, indent=2)
 
 
 # ── OAuth ────────────────────────────────────────────────────────────────────
@@ -174,7 +238,8 @@ def authorize(cfg):
     print(f"If it doesn't open, visit:\n{auth_url}\n")
     webbrowser.open(auth_url)
 
-    server = HTTPServer(("localhost", REDIRECT_PORT), OAuthCallbackHandler)
+    # Bind on all interfaces so Docker's published callback port can reach us.
+    server = HTTPServer((REDIRECT_BIND, REDIRECT_PORT), OAuthCallbackHandler)
     server.timeout = 120
     print("Waiting for authorization (timeout: 2 min)...")
 
@@ -201,6 +266,7 @@ def authorize(cfg):
 
 
 def save_token(token_data):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     with open(TOKEN_FILE, "w") as f:
         json.dump({
             "access_token": token_data["access_token"],
@@ -466,7 +532,7 @@ def build_gpx_relocated(activity, streams, home_lat, home_lon):
 
 def save_gpx(activity, gpx_xml):
     """Save GPX file to output directory. Returns the file path."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     date_str = activity["start_date"][:10]
     activity_id = activity["id"]
@@ -555,32 +621,59 @@ def get_home_location(cfg):
 
 # ── Dawarich Push ────────────────────────────────────────────────────────────
 
-def push_to_dawarich(cfg, gpx_files):
+def push_to_dawarich(cfg, gpx_files, dry_run=False):
     """Upload GPX files to Dawarich's import endpoint."""
     if not cfg.get("dawarich_url") or not cfg.get("dawarich_api_key"):
         print("Dawarich not configured. Skipping push.")
-        return
+        return 0
 
     import_url = f"{cfg['dawarich_url']}/api/v1/imports"
     headers = {"Authorization": f"Bearer {cfg['dawarich_api_key']}"}
+    uploaded_files = load_import_state()
+    failures = 0
 
     for gpx_path in gpx_files:
+        if gpx_path.name in uploaded_files:
+            print(f"  Skipping {gpx_path.name} (already uploaded)")
+            continue
+        if dry_run:
+            print(f"  [dry-run] Would upload {gpx_path.name}")
+            continue
         print(f"  Pushing {gpx_path.name}...")
-        with open(gpx_path, "rb") as f:
-            resp = requests.post(
-                import_url,
-                headers=headers,
-                files={"file": (gpx_path.name, f, "application/gpx+xml")},
-            )
+        try:
+            with open(gpx_path, "rb") as f:
+                resp = requests.post(
+                    import_url,
+                    headers=headers,
+                    files={"file": (gpx_path.name, f, "application/gpx+xml")},
+                    timeout=60,
+                )
+        except requests.RequestException as exc:
+            failures += 1
+            print(f"    [ERROR] Network error: {exc}")
+            continue
         if resp.ok:
-            print(f"    ✓ Uploaded")
+            print("    [OK] Uploaded")
+            uploaded_files.add(gpx_path.name)
+            save_import_state(uploaded_files)
         else:
-            print(f"    ✗ Failed ({resp.status_code}): {resp.text[:200]}")
+            failures += 1
+            print(f"    [ERROR] Failed ({resp.status_code}): {resp.text[:200]}")
+    return failures
+
+
+def pending_gpx_files(gpx_dir=None):
+    """List GPX files not yet recorded as successfully uploaded."""
+    directory = gpx_dir or OUTPUT_DIR
+    if not directory.exists():
+        return []
+    uploaded_files = load_import_state()
+    return [path for path in sorted(directory.glob("*.gpx")) if path.name not in uploaded_files]
 
 
 # ── Main sync logic ─────────────────────────────────────────────────────────
 
-def sync(cfg, after_timestamp=None):
+def sync(cfg, after_timestamp=None, dry_run=False):
     """Fetch new activities, convert to GPX, optionally push to Dawarich."""
     token = get_token(cfg)
     access_token = token["access_token"]
@@ -598,7 +691,8 @@ def sync(cfg, after_timestamp=None):
         after = int(datetime.now(timezone.utc).timestamp())
         state["last_sync"] = after
         state["fetched_ids"] = []
-        save_state(state)
+        if not dry_run:
+            save_state(state)
         print(f"First run. Baseline set to {datetime.fromtimestamp(after, tz=timezone.utc).isoformat()}.")
         print("Future syncs will grab activities after this point.")
         print("Use --days, --months, or --all to pull historical data.")
@@ -638,8 +732,11 @@ def sync(cfg, after_timestamp=None):
             home_lat, home_lon = home
             streams = get_activity_streams(access_token, activity["id"])
             gpx_xml = build_gpx_relocated(activity, streams or {}, home_lat, home_lon)
-            filepath = save_gpx(activity, gpx_xml)
-            gpx_files.append(filepath)
+            if dry_run:
+                filepath = Path(f"{activity['id']}.gpx")
+            else:
+                filepath = save_gpx(activity, gpx_xml)
+                gpx_files.append(filepath)
             fetched_ids.add(activity["id"])
             print(f"    Saved (virtual → home): {filepath.name}")
             time.sleep(0.5)
@@ -658,8 +755,11 @@ def sync(cfg, after_timestamp=None):
             continue
 
         gpx_xml = build_gpx(activity, streams)
-        filepath = save_gpx(activity, gpx_xml)
-        gpx_files.append(filepath)
+        if dry_run:
+            filepath = Path(f"{activity['id']}.gpx")
+        else:
+            filepath = save_gpx(activity, gpx_xml)
+            gpx_files.append(filepath)
         fetched_ids.add(activity["id"])
         print(f"    Saved: {filepath.name}")
 
@@ -669,9 +769,13 @@ def sync(cfg, after_timestamp=None):
     # Update state
     state["last_sync"] = int(datetime.now(timezone.utc).timestamp())
     state["fetched_ids"] = list(fetched_ids)
-    save_state(state)
+    if not dry_run:
+        save_state(state)
 
-    print(f"\n{len(gpx_files)} GPX files saved to {OUTPUT_DIR}/")
+    if dry_run:
+        print(f"\n[dry-run] {len(new_activities)} activities examined; no GPX or state written.")
+    else:
+        print(f"\n{len(gpx_files)} GPX files saved to {OUTPUT_DIR}/")
     return gpx_files
 
 
@@ -692,14 +796,17 @@ def parse_args():
     sync_parser.add_argument("--months", type=int, help="Pull activities from the last N months")
     sync_parser.add_argument("--all", action="store_true", help="Pull all activities from all time")
     sync_parser.add_argument("--no-push", action="store_true", help="Don't push to Dawarich after sync")
+    sync_parser.add_argument("--dry-run", action="store_true", help="Preview without writing GPX/state or pushing")
 
     push_parser = sub.add_parser("push", help="Push existing GPX files to Dawarich")
     push_parser.add_argument("--dir", type=str, help="Directory of GPX files (default: gpx_output/)")
+    push_parser.add_argument("--dry-run", action="store_true", help="Preview uploads without changing Dawarich")
 
     return parser.parse_args()
 
 
 def main():
+    setup_logging()
     args = parse_args()
 
     if args.command == "setup":
@@ -724,10 +831,16 @@ def main():
         elif args.days:
             after = int((datetime.now(timezone.utc) - timedelta(days=args.days)).timestamp())
 
-        gpx_files = sync(cfg, after_timestamp=after)
+        gpx_files = sync(cfg, after_timestamp=after, dry_run=args.dry_run)
 
-        if gpx_files and not args.no_push:
-            push_to_dawarich(cfg, gpx_files)
+        if not args.no_push and not args.dry_run:
+            pending_files = pending_gpx_files()
+            if pending_files:
+                print(f"Pushing {len(pending_files)} pending GPX files to Dawarich...")
+                failures = push_to_dawarich(cfg, pending_files)
+                if failures:
+                    print(f"{failures} upload(s) failed and will be retried on the next sync.")
+                    sys.exit(1)
 
         return
 
@@ -737,12 +850,14 @@ def main():
         if not gpx_dir.exists():
             print(f"Directory not found: {gpx_dir}")
             sys.exit(1)
-        gpx_files = sorted(gpx_dir.glob("*.gpx"))
+        gpx_files = pending_gpx_files(gpx_dir)
         if not gpx_files:
-            print("No GPX files found.")
+            print("No pending GPX files found.")
             return
         print(f"Pushing {len(gpx_files)} GPX files to Dawarich...")
-        push_to_dawarich(cfg, gpx_files)
+        failures = push_to_dawarich(cfg, gpx_files, dry_run=args.dry_run)
+        if failures:
+            sys.exit(1)
         return
 
     # No command given

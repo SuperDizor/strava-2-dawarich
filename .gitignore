@@ -34,6 +34,10 @@ token.json
 
 # Output
 gpx_output/
+data/
+logs/
+certs/*.pem
+!certs/README.md
 
 # Release script (local only)
 release.ps1

@@ -1,0 +1,8 @@
+.git
+.env
+data/
+gpx_output/
+state.json
+token.json
+__pycache__/
+*.pyc
