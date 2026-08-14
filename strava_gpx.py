@@ -815,7 +815,10 @@ def sync(cfg, after_timestamp=None, dry_run=False, dedup_dawarich=False, dedup_r
     activities = get_activities(access_token, after=after)
     print(f"Found {len(activities)} activities.")
 
-    new_activities = [a for a in activities if a["id"] not in fetched_ids]
+    # A dedup preview must be able to re-examine activities already synced.
+    new_activities = activities if dedup_dawarich else [
+        activity for activity in activities if activity["id"] not in fetched_ids
+    ]
     if not new_activities:
         print("No new activities to process.")
         return []

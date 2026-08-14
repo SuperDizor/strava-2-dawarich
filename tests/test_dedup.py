@@ -91,6 +91,30 @@ class DeduplicationTests(unittest.TestCase):
         self.assertEqual(report["outside_corridor"], 1)
         self.assertTrue((app.DEDUP_REPORT_DIR / "strava-42.json").exists())
 
+    def test_dedup_preview_reexamines_already_fetched_activity(self):
+        activity = {
+            "id": 42,
+            "name": "Existing Ride",
+            "type": "Ride",
+            "start_date": "2026-08-14T12:00:00Z",
+            "elapsed_time": 60,
+            "start_latlng": [46.8, -71.2],
+        }
+        app.STATE_FILE = app.STATE_DIR / "state.json"
+        app.STATE_DIR.mkdir()
+        app.STATE_FILE.write_text(
+            json.dumps({"last_sync": 1, "fetched_ids": [42]}), encoding="utf-8"
+        )
+        streams = {"latlng": [[46.8, -71.2]], "time": [0]}
+
+        with patch.object(app, "get_token", return_value={"access_token": "token"}), \
+                patch.object(app, "get_activities", return_value=[activity]), \
+                patch.object(app, "get_activity_streams", return_value=streams), \
+                patch.object(app, "analyze_dawarich_overlap") as analyze:
+            app.sync({}, after_timestamp=0, dry_run=True, dedup_dawarich=True)
+
+        analyze.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
