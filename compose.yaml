@@ -14,6 +14,7 @@ services:
       STRAVA_CALLBACK_BIND: 0.0.0.0
       CUSTOM_CA_CERT: /certs/rootCA.pem
       REQUESTS_CA_BUNDLE: /tmp/combined-ca.pem
+      DAWARICH_DEDUP_REPORT_DIR: /data/state/dedup-reports
     volumes:
       - ${APPDATA_PATH:-./data}/state:/data/state
       - ${APPDATA_PATH:-./data}/gpx:/data/gpx

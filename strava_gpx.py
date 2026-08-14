@@ -5,7 +5,9 @@ Strava-2-Dawarich: Pull Strava activities as GPX and push to Dawarich.
 
 import argparse
 import json
+import math
 import os
+import shutil
 import sys
 import time
 import webbrowser
@@ -29,6 +31,7 @@ CONFIG_FILE = STATE_DIR / "config.json"
 STATE_FILE = STATE_DIR / "state.json"
 TOKEN_FILE = STATE_DIR / "token.json"
 IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
+DEDUP_REPORT_DIR = Path(os.environ.get("DAWARICH_DEDUP_REPORT_DIR", STATE_DIR / "dedup-reports")).resolve()
 
 STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
@@ -51,7 +54,7 @@ VIRTUAL_TYPES = {"VirtualRide", "VirtualRun"}
 def configure_runtime_paths():
     """Refresh storage paths after values from .env have been loaded."""
     global DATA_DIR, STATE_DIR, OUTPUT_DIR, LOG_DIR
-    global CONFIG_FILE, STATE_FILE, TOKEN_FILE, IMPORT_STATE_FILE
+    global CONFIG_FILE, STATE_FILE, TOKEN_FILE, IMPORT_STATE_FILE, DEDUP_REPORT_DIR
     DATA_DIR = Path(os.environ.get("DATA_DIR", SCRIPT_DIR)).resolve()
     STATE_DIR = Path(os.environ.get("STATE_DIR", DATA_DIR)).resolve()
     OUTPUT_DIR = Path(os.environ.get("GPX_DIR", DATA_DIR / "gpx_output")).resolve()
@@ -60,6 +63,9 @@ def configure_runtime_paths():
     STATE_FILE = STATE_DIR / "state.json"
     TOKEN_FILE = STATE_DIR / "token.json"
     IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
+    DEDUP_REPORT_DIR = Path(
+        os.environ.get("DAWARICH_DEDUP_REPORT_DIR", STATE_DIR / "dedup-reports")
+    ).resolve()
 
 
 class TeeStream:
@@ -195,6 +201,216 @@ def save_import_state(uploaded_files):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with open(IMPORT_STATE_FILE, "w") as f:
         json.dump({"uploaded_files": sorted(uploaded_files)}, f, indent=2)
+
+
+# ── Dawarich deduplication preview ──────────────────────────────────────────
+
+def haversine_meters(lat1, lon1, lat2, lon2):
+    """Return the great-circle distance between two coordinates in meters."""
+    radius = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    value = (math.sin(d_phi / 2) ** 2
+             + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2)
+    return radius * 2 * math.atan2(math.sqrt(value), math.sqrt(1 - value))
+
+
+def gpx_coordinates(gpx_xml):
+    """Extract track coordinates from generated GPX XML."""
+    root = ET.fromstring(gpx_xml)
+    coordinates = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] == "trkpt":
+            coordinates.append((float(element.attrib["lat"]), float(element.attrib["lon"])))
+    return coordinates
+
+
+def point_coordinates(point):
+    """Normalize Dawarich full or slim point representations."""
+    latitude = point.get("lat", point.get("latitude"))
+    longitude = point.get("lng", point.get("lon", point.get("longitude")))
+    if latitude is None or longitude is None:
+        return None
+    return float(latitude), float(longitude)
+
+
+def fetch_dawarich_points(cfg, start_timestamp, end_timestamp):
+    """Fetch every Dawarich point in a Unix timestamp window."""
+    url = f"{cfg['dawarich_url']}/api/v1/points"
+    headers = {"Authorization": f"Bearer {cfg['dawarich_api_key']}"}
+    points = []
+    page = 1
+
+    while True:
+        response = requests.get(
+            url,
+            headers=headers,
+            params={
+                "start_at": start_timestamp,
+                "end_at": end_timestamp,
+                "order": "asc",
+                # Full representation is required for tracker_id source filtering.
+                "slim": "false",
+                "page": page,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, list):
+            page_points = payload
+        else:
+            page_points = payload.get("points", payload.get("data", []))
+        points.extend(page_points)
+
+        total_pages = int(response.headers.get("X-Total-Pages", "1"))
+        if page >= total_pages or not page_points:
+            break
+        page += 1
+    return points
+
+
+def analyze_dawarich_overlap(
+        cfg, activity, gpx_xml, radius_meters=200, allowed_tracker_ids=None):
+    """Read-only analysis of Dawarich points overlapping a Strava activity."""
+    start = int(datetime.fromisoformat(activity["start_date"].replace("Z", "+00:00")).timestamp())
+    end = start + int(activity.get("elapsed_time", 0))
+    track = gpx_coordinates(gpx_xml)
+    points = fetch_dawarich_points(cfg, start, end)
+    if allowed_tracker_ids is None:
+        allowed_tracker_ids = {
+            value.strip()
+            for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
+            if value.strip()
+        }
+    else:
+        allowed_tracker_ids = set(allowed_tracker_ids)
+    candidates = []
+    invalid = 0
+    gpx_preserved = 0
+    unapproved_preserved = 0
+    tracker_summary = {}
+
+    for point in points:
+        tracker_id = point.get("tracker_id") or "<none>"
+        tracker_summary[tracker_id] = tracker_summary.get(tracker_id, 0) + 1
+        if tracker_id.startswith("gpx-"):
+            gpx_preserved += 1
+            continue
+        if tracker_id not in allowed_tracker_ids:
+            unapproved_preserved += 1
+            continue
+        coordinates = point_coordinates(point)
+        if not coordinates or not track:
+            invalid += 1
+            continue
+        latitude, longitude = coordinates
+        nearest = min(haversine_meters(latitude, longitude, lat, lon) for lat, lon in track)
+        if nearest <= radius_meters:
+            candidates.append({
+                "id": point.get("id"),
+                "tracker_id": tracker_id,
+                "distance_m": round(nearest, 1),
+                "original_point": point,
+            })
+
+    report = {
+        "activity_id": activity["id"],
+        "activity_name": activity.get("name", "Unknown"),
+        "start_timestamp": start,
+        "end_timestamp": end,
+        "radius_meters": radius_meters,
+        "allowed_tracker_ids": sorted(allowed_tracker_ids),
+        "tracker_summary": tracker_summary,
+        "dawarich_points": len(points),
+        "candidate_points": candidates,
+        "gpx_points_preserved": gpx_preserved,
+        "unapproved_tracker_points_preserved": unapproved_preserved,
+        "outside_corridor": (
+            len(points) - len(candidates) - invalid - gpx_preserved - unapproved_preserved
+        ),
+        "invalid_points": invalid,
+    }
+    print(f"    Dawarich overlap: {len(points)} points in time window")
+    print(f"    Tracker sources: {tracker_summary}")
+    print(f"    GPX points preserved: {gpx_preserved}")
+    print(f"    Unapproved tracker points preserved: {unapproved_preserved}")
+    print(f"    Dedup candidates: {len(candidates)} within {radius_meters} m of Strava track")
+    print(f"    Preserved: {report['outside_corridor']} outside corridor; {invalid} invalid")
+    DEDUP_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = DEDUP_REPORT_DIR / f"strava-{activity['id']}.json"
+    with open(report_path, "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, indent=2)
+    print(f"    Report: {report_path}")
+    return report
+
+
+def delete_dawarich_candidates(cfg, report_path, confirmation, max_points=5000, batch_size=500):
+    """Delete candidates from a reviewed report after strict safety checks."""
+    report_path = Path(report_path).resolve()
+    with open(report_path, encoding="utf-8") as report_file:
+        report = json.load(report_file)
+
+    activity_id = str(report.get("activity_id", ""))
+    if str(confirmation) != activity_id:
+        raise ValueError(f"Confirmation must exactly match Strava activity ID {activity_id}")
+
+    candidates = report.get("candidate_points", [])
+    if not candidates:
+        raise ValueError("Report contains no deletion candidates")
+    if len(candidates) > max_points:
+        raise ValueError(
+            f"Report has {len(candidates)} candidates, exceeding safety limit {max_points}"
+        )
+    if report.get("gpx_points_preserved", 0) <= 0:
+        raise ValueError("No imported GPX points were detected; refusing replacement deletion")
+    if any("original_point" not in candidate for candidate in candidates):
+        raise ValueError("Report lacks full point backups; regenerate it with --dedup-dawarich --dry-run")
+
+    allowed_trackers = {
+        value.strip()
+        for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
+        if value.strip()
+    }
+    candidate_trackers = {candidate.get("tracker_id") for candidate in candidates}
+    if not allowed_trackers or not candidate_trackers.issubset(allowed_trackers):
+        raise ValueError(
+            f"Candidate trackers {sorted(candidate_trackers)} are not covered by current allowlist"
+        )
+
+    backup_dir = STATE_DIR / "dedup-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = backup_dir / f"strava-{activity_id}-{timestamp}.json"
+    shutil.copy2(report_path, backup_path)
+    print(f"Backup created: {backup_path}")
+
+    url = f"{cfg['dawarich_url']}/api/v1/points/bulk_destroy"
+    headers = {"Authorization": f"Bearer {cfg['dawarich_api_key']}"}
+    point_ids = [candidate["id"] for candidate in candidates]
+    deleted = 0
+
+    for offset in range(0, len(point_ids), batch_size):
+        batch = point_ids[offset:offset + batch_size]
+        response = requests.delete(
+            url,
+            headers=headers,
+            json={"point_ids": batch},
+            timeout=60,
+        )
+        response.raise_for_status()
+        deleted += len(batch)
+        print(f"Deleted {deleted}/{len(point_ids)} points")
+
+    report["deletion"] = {
+        "deleted_at": datetime.now(timezone.utc).isoformat(),
+        "deleted_points": deleted,
+        "backup_path": str(backup_path),
+    }
+    with open(report_path, "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, indent=2)
+    return deleted
 
 
 # ── OAuth ────────────────────────────────────────────────────────────────────
@@ -673,7 +889,7 @@ def pending_gpx_files(gpx_dir=None):
 
 # ── Main sync logic ─────────────────────────────────────────────────────────
 
-def sync(cfg, after_timestamp=None, dry_run=False):
+def sync(cfg, after_timestamp=None, dry_run=False, dedup_dawarich=False, dedup_radius=200):
     """Fetch new activities, convert to GPX, optionally push to Dawarich."""
     token = get_token(cfg)
     access_token = token["access_token"]
@@ -702,7 +918,10 @@ def sync(cfg, after_timestamp=None, dry_run=False):
     activities = get_activities(access_token, after=after)
     print(f"Found {len(activities)} activities.")
 
-    new_activities = [a for a in activities if a["id"] not in fetched_ids]
+    # A dedup preview must be able to re-examine activities already synced.
+    new_activities = activities if dedup_dawarich else [
+        activity for activity in activities if activity["id"] not in fetched_ids
+    ]
     if not new_activities:
         print("No new activities to process.")
         return []
@@ -732,6 +951,8 @@ def sync(cfg, after_timestamp=None, dry_run=False):
             home_lat, home_lon = home
             streams = get_activity_streams(access_token, activity["id"])
             gpx_xml = build_gpx_relocated(activity, streams or {}, home_lat, home_lon)
+            if dedup_dawarich:
+                analyze_dawarich_overlap(cfg, activity, gpx_xml, dedup_radius)
             if dry_run:
                 filepath = Path(f"{activity['id']}.gpx")
             else:
@@ -755,6 +976,8 @@ def sync(cfg, after_timestamp=None, dry_run=False):
             continue
 
         gpx_xml = build_gpx(activity, streams)
+        if dedup_dawarich:
+            analyze_dawarich_overlap(cfg, activity, gpx_xml, dedup_radius)
         if dry_run:
             filepath = Path(f"{activity['id']}.gpx")
         else:
@@ -797,10 +1020,25 @@ def parse_args():
     sync_parser.add_argument("--all", action="store_true", help="Pull all activities from all time")
     sync_parser.add_argument("--no-push", action="store_true", help="Don't push to Dawarich after sync")
     sync_parser.add_argument("--dry-run", action="store_true", help="Preview without writing GPX/state or pushing")
+    sync_parser.add_argument(
+        "--dedup-dawarich",
+        action="store_true",
+        help="Preview Dawarich points overlapping each Strava track (requires --dry-run)",
+    )
 
     push_parser = sub.add_parser("push", help="Push existing GPX files to Dawarich")
     push_parser.add_argument("--dir", type=str, help="Directory of GPX files (default: gpx_output/)")
     push_parser.add_argument("--dry-run", action="store_true", help="Preview uploads without changing Dawarich")
+
+    dedup_parser = sub.add_parser(
+        "dedup", help="Delete reviewed Dawarich candidates from one saved report"
+    )
+    dedup_parser.add_argument("--report", required=True, help="Path to a reviewed dedup report")
+    dedup_parser.add_argument(
+        "--confirm-delete",
+        required=True,
+        help="Exact Strava activity ID required to authorize deletion",
+    )
 
     return parser.parse_args()
 
@@ -822,6 +1060,16 @@ def main():
     if args.command == "sync":
         cfg = load_config()
 
+        if args.dedup_dawarich and not args.dry_run:
+            print("--dedup-dawarich is read-only in this release and requires --dry-run.")
+            sys.exit(2)
+        if args.dedup_dawarich and not cfg.get("dawarich_url"):
+            print("Dawarich must be configured for --dedup-dawarich.")
+            sys.exit(2)
+        if args.dedup_dawarich and not os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").strip():
+            print("Set DAWARICH_DEDUP_TRACKER_IDS to the tracker IDs allowed for deduplication.")
+            sys.exit(2)
+
         after = None
         if args.all:
             after = 0
@@ -831,7 +1079,14 @@ def main():
         elif args.days:
             after = int((datetime.now(timezone.utc) - timedelta(days=args.days)).timestamp())
 
-        gpx_files = sync(cfg, after_timestamp=after, dry_run=args.dry_run)
+        dedup_radius = int(os.environ.get("DAWARICH_DEDUP_RADIUS_METERS", "200"))
+        gpx_files = sync(
+            cfg,
+            after_timestamp=after,
+            dry_run=args.dry_run,
+            dedup_dawarich=args.dedup_dawarich,
+            dedup_radius=dedup_radius,
+        )
 
         if not args.no_push and not args.dry_run:
             pending_files = pending_gpx_files()
@@ -860,8 +1115,26 @@ def main():
             sys.exit(1)
         return
 
+    if args.command == "dedup":
+        cfg = load_config()
+        max_points = int(os.environ.get("DAWARICH_DEDUP_MAX_POINTS", "5000"))
+        batch_size = int(os.environ.get("DAWARICH_DEDUP_BATCH_SIZE", "500"))
+        try:
+            deleted = delete_dawarich_candidates(
+                cfg,
+                args.report,
+                args.confirm_delete,
+                max_points=max_points,
+                batch_size=batch_size,
+            )
+        except (OSError, ValueError, requests.RequestException) as exc:
+            print(f"Deduplication aborted: {exc}")
+            sys.exit(1)
+        print(f"Deduplication complete: {deleted} legacy Dawarich points deleted.")
+        return
+
     # No command given
-    print("Usage: python strava_gpx.py {setup|auth|sync|push}")
+    print("Usage: python strava_gpx.py {setup|auth|sync|push|dedup}")
     print("Run with --help for details.")
 
 
