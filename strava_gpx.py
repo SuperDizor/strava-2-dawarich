@@ -31,6 +31,7 @@ CONFIG_FILE = STATE_DIR / "config.json"
 STATE_FILE = STATE_DIR / "state.json"
 TOKEN_FILE = STATE_DIR / "token.json"
 IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
+AUTO_DEDUP_QUEUE_FILE = STATE_DIR / "auto_dedup_queue.json"
 DEDUP_REPORT_DIR = Path(os.environ.get("DAWARICH_DEDUP_REPORT_DIR", STATE_DIR / "dedup-reports")).resolve()
 
 STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
@@ -54,7 +55,8 @@ VIRTUAL_TYPES = {"VirtualRide", "VirtualRun"}
 def configure_runtime_paths():
     """Refresh storage paths after values from .env have been loaded."""
     global DATA_DIR, STATE_DIR, OUTPUT_DIR, LOG_DIR
-    global CONFIG_FILE, STATE_FILE, TOKEN_FILE, IMPORT_STATE_FILE, DEDUP_REPORT_DIR
+    global CONFIG_FILE, STATE_FILE, TOKEN_FILE, IMPORT_STATE_FILE
+    global AUTO_DEDUP_QUEUE_FILE, DEDUP_REPORT_DIR
     DATA_DIR = Path(os.environ.get("DATA_DIR", SCRIPT_DIR)).resolve()
     STATE_DIR = Path(os.environ.get("STATE_DIR", DATA_DIR)).resolve()
     OUTPUT_DIR = Path(os.environ.get("GPX_DIR", DATA_DIR / "gpx_output")).resolve()
@@ -63,6 +65,7 @@ def configure_runtime_paths():
     STATE_FILE = STATE_DIR / "state.json"
     TOKEN_FILE = STATE_DIR / "token.json"
     IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
+    AUTO_DEDUP_QUEUE_FILE = STATE_DIR / "auto_dedup_queue.json"
     DEDUP_REPORT_DIR = Path(
         os.environ.get("DAWARICH_DEDUP_REPORT_DIR", STATE_DIR / "dedup-reports")
     ).resolve()
@@ -411,6 +414,138 @@ def delete_dawarich_candidates(cfg, report_path, confirmation, max_points=5000, 
     with open(report_path, "w", encoding="utf-8") as report_file:
         json.dump(report, report_file, indent=2)
     return deleted
+
+
+def activity_from_gpx_file(gpx_path):
+    """Reconstruct the activity window needed for post-import deduplication."""
+    gpx_path = Path(gpx_path)
+    gpx_xml = gpx_path.read_text(encoding="utf-8")
+    root = ET.fromstring(gpx_xml)
+    name = gpx_path.stem
+    metadata_time = None
+    track_times = []
+
+    for element in root.iter():
+        local_name = element.tag.rsplit("}", 1)[-1]
+        if local_name == "metadata":
+            for child in element:
+                child_name = child.tag.rsplit("}", 1)[-1]
+                if child_name == "name" and child.text:
+                    name = child.text
+                elif child_name == "time" and child.text:
+                    metadata_time = child.text
+        elif local_name == "trkpt":
+            for child in element:
+                if child.tag.rsplit("}", 1)[-1] == "time" and child.text:
+                    track_times.append(child.text)
+
+    parts = gpx_path.stem.split("_", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise ValueError(f"Cannot extract Strava activity ID from {gpx_path.name}")
+    if not metadata_time and not track_times:
+        raise ValueError(f"No timestamps found in {gpx_path.name}")
+
+    start_text = metadata_time or track_times[0]
+    start = datetime.fromisoformat(start_text.replace("Z", "+00:00"))
+    end = datetime.fromisoformat((track_times[-1] if track_times else start_text).replace("Z", "+00:00"))
+    return {
+        "id": int(parts[1]),
+        "name": name,
+        "start_date": start.isoformat().replace("+00:00", "Z"),
+        "elapsed_time": max(0, int((end - start).total_seconds())),
+    }, gpx_xml
+
+
+def wait_for_dawarich_gpx(cfg, activity, timeout_seconds=300, interval_seconds=10):
+    """Wait until Dawarich exposes imported GPX points for an activity window."""
+    start = int(datetime.fromisoformat(activity["start_date"].replace("Z", "+00:00")).timestamp())
+    end = start + int(activity["elapsed_time"])
+    deadline = time.monotonic() + timeout_seconds
+
+    while True:
+        points = fetch_dawarich_points(cfg, start, end)
+        gpx_count = sum(
+            1 for point in points if (point.get("tracker_id") or "").startswith("gpx-")
+        )
+        if gpx_count:
+            print(f"    Dawarich GPX processing confirmed: {gpx_count} points")
+            return gpx_count
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Dawarich did not expose GPX points for activity {activity['id']} "
+                f"within {timeout_seconds} seconds"
+            )
+        print(f"    Waiting for Dawarich GPX processing ({interval_seconds}s)...")
+        time.sleep(interval_seconds)
+
+
+def auto_dedup_uploaded_files(cfg, gpx_files):
+    """Safely deduplicate newly uploaded GPX files when explicitly enabled."""
+    radius = int(os.environ.get("DAWARICH_DEDUP_RADIUS_METERS", "200"))
+    max_points = int(os.environ.get("DAWARICH_AUTO_DEDUP_MAX_POINTS", "5000"))
+    batch_size = int(os.environ.get("DAWARICH_DEDUP_BATCH_SIZE", "500"))
+    timeout_seconds = int(os.environ.get("DAWARICH_AUTO_DEDUP_WAIT_SECONDS", "300"))
+    interval_seconds = int(os.environ.get("DAWARICH_AUTO_DEDUP_POLL_SECONDS", "10"))
+
+    for gpx_path in gpx_files:
+        activity, gpx_xml = activity_from_gpx_file(gpx_path)
+        print(f"Auto-dedup activity {activity['id']} ({activity['name']})")
+        wait_for_dawarich_gpx(
+            cfg, activity, timeout_seconds=timeout_seconds, interval_seconds=interval_seconds
+        )
+        report = analyze_dawarich_overlap(cfg, activity, gpx_xml, radius)
+        candidates = report["candidate_points"]
+        if not candidates:
+            print("    No legacy points require deletion.")
+            continue
+
+        report_path = DEDUP_REPORT_DIR / f"strava-{activity['id']}.json"
+        delete_dawarich_candidates(
+            cfg,
+            report_path,
+            confirmation=str(activity["id"]),
+            max_points=max_points,
+            batch_size=batch_size,
+        )
+        verification = analyze_dawarich_overlap(cfg, activity, gpx_xml, radius)
+        if verification["candidate_points"]:
+            raise RuntimeError(
+                f"Post-delete verification found remaining candidates for activity {activity['id']}"
+            )
+        print("    Auto-dedup verification complete: 0 candidates remain.")
+
+
+def load_auto_dedup_queue():
+    if AUTO_DEDUP_QUEUE_FILE.exists():
+        with open(AUTO_DEDUP_QUEUE_FILE, encoding="utf-8") as queue_file:
+            return list(json.load(queue_file).get("gpx_files", []))
+    return []
+
+
+def save_auto_dedup_queue(filenames):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(AUTO_DEDUP_QUEUE_FILE, "w", encoding="utf-8") as queue_file:
+        json.dump({"gpx_files": filenames}, queue_file, indent=2)
+
+
+def enqueue_auto_dedup(gpx_files):
+    queue = load_auto_dedup_queue()
+    for gpx_path in gpx_files:
+        if gpx_path.name not in queue:
+            queue.append(gpx_path.name)
+    save_auto_dedup_queue(queue)
+
+
+def process_auto_dedup_queue(cfg):
+    """Process queued uploads, retaining each item until fully verified."""
+    queue = load_auto_dedup_queue()
+    for filename in list(queue):
+        gpx_path = OUTPUT_DIR / filename
+        if not gpx_path.exists():
+            raise OSError(f"Queued GPX file is missing: {gpx_path}")
+        auto_dedup_uploaded_files(cfg, [gpx_path])
+        queue.remove(filename)
+        save_auto_dedup_queue(queue)
 
 
 # ── OAuth ────────────────────────────────────────────────────────────────────
@@ -841,12 +976,13 @@ def push_to_dawarich(cfg, gpx_files, dry_run=False):
     """Upload GPX files to Dawarich's import endpoint."""
     if not cfg.get("dawarich_url") or not cfg.get("dawarich_api_key"):
         print("Dawarich not configured. Skipping push.")
-        return 0
+        return 0, []
 
     import_url = f"{cfg['dawarich_url']}/api/v1/imports"
     headers = {"Authorization": f"Bearer {cfg['dawarich_api_key']}"}
     uploaded_files = load_import_state()
     failures = 0
+    uploaded_now = []
 
     for gpx_path in gpx_files:
         if gpx_path.name in uploaded_files:
@@ -871,11 +1007,12 @@ def push_to_dawarich(cfg, gpx_files, dry_run=False):
         if resp.ok:
             print("    [OK] Uploaded")
             uploaded_files.add(gpx_path.name)
+            uploaded_now.append(gpx_path)
             save_import_state(uploaded_files)
         else:
             failures += 1
             print(f"    [ERROR] Failed ({resp.status_code}): {resp.text[:200]}")
-    return failures
+    return failures, uploaded_now
 
 
 def pending_gpx_files(gpx_dir=None):
@@ -1089,12 +1226,26 @@ def main():
         )
 
         if not args.no_push and not args.dry_run:
+            auto_enabled = (
+                os.environ.get("DAWARICH_AUTO_DEDUP", "false").lower()
+                in {"1", "true", "yes"}
+            )
             pending_files = pending_gpx_files()
             if pending_files:
                 print(f"Pushing {len(pending_files)} pending GPX files to Dawarich...")
-                failures = push_to_dawarich(cfg, pending_files)
+                failures, uploaded_now = push_to_dawarich(cfg, pending_files)
+                if auto_enabled and uploaded_now:
+                    enqueue_auto_dedup(uploaded_now)
                 if failures:
                     print(f"{failures} upload(s) failed and will be retried on the next sync.")
+                    sys.exit(1)
+            if auto_enabled and load_auto_dedup_queue():
+                try:
+                    process_auto_dedup_queue(cfg)
+                except (OSError, ValueError, RuntimeError, TimeoutError,
+                        requests.RequestException) as exc:
+                    print(f"Automatic deduplication failed: {exc}")
+                    print("The activity remains queued for the next sync.")
                     sys.exit(1)
 
         return
@@ -1110,7 +1261,7 @@ def main():
             print("No pending GPX files found.")
             return
         print(f"Pushing {len(gpx_files)} GPX files to Dawarich...")
-        failures = push_to_dawarich(cfg, gpx_files, dry_run=args.dry_run)
+        failures, _ = push_to_dawarich(cfg, gpx_files, dry_run=args.dry_run)
         if failures:
             sys.exit(1)
         return

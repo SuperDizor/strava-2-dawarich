@@ -165,7 +165,30 @@ docker compose exec strava-2-dawarich python strava_gpx.py dedup \
 The command refuses reports without full point backups, without existing GPX
 points, above `DAWARICH_DEDUP_MAX_POINTS`, or containing trackers outside the
 current allowlist. It copies the reviewed report to `state/dedup-backups/`
-before deleting in bounded batches. Deduplication is never run by `sync` or cron.
+before deleting in bounded batches. This manual command is never invoked unless
+explicitly requested; automatic behavior requires the separate opt-in below.
+
+### Automatic post-import deduplication
+
+Automatic cleanup is disabled by default. When `DAWARICH_AUTO_DEDUP=true`, a
+normal `sync` performs cleanup only for GPX files successfully uploaded during
+that same run. It waits until Dawarich exposes `gpx-*` points, generates the
+same full backup report, applies the tracker allowlist and automatic safety
+limit, deletes in batches, and verifies that zero candidates remain.
+
+```dotenv
+DAWARICH_AUTO_DEDUP=true
+DAWARICH_AUTO_DEDUP_MAX_POINTS=5000
+DAWARICH_AUTO_DEDUP_WAIT_SECONDS=300
+DAWARICH_AUTO_DEDUP_POLL_SECONDS=10
+```
+
+If import processing times out, candidate count exceeds the limit, deletion
+fails, or post-delete verification finds remaining candidates, `sync` exits
+non-zero so cron records a failure. The GPX remains in
+`state/auto_dedup_queue.json` and is retried on the next sync; it is removed
+from the queue only after successful post-delete verification. Manual `push`
+never triggers auto-dedup.
 
 ## Automating with Cron (Unraid User Scripts)
 

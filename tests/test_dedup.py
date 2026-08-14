@@ -28,6 +28,7 @@ class DeduplicationTests(unittest.TestCase):
         app.STATE_DIR = self.root / "state"
         app.OUTPUT_DIR = self.root / "gpx"
         app.IMPORT_STATE_FILE = app.STATE_DIR / "dawarich_imports.json"
+        app.AUTO_DEDUP_QUEUE_FILE = app.STATE_DIR / "auto_dedup_queue.json"
         app.DEDUP_REPORT_DIR = app.STATE_DIR / "dedup-reports"
         app.OUTPUT_DIR.mkdir()
 
@@ -49,9 +50,10 @@ class DeduplicationTests(unittest.TestCase):
         cfg = {"dawarich_url": "https://example.test", "dawarich_api_key": "key"}
 
         with patch.object(app.requests, "post", side_effect=Exception("offline")):
-            failures = app.push_to_dawarich(cfg, [pending])
+            failures, uploaded = app.push_to_dawarich(cfg, [pending])
 
         self.assertEqual(failures, 1)
+        self.assertEqual(uploaded, [])
         self.assertFalse(app.IMPORT_STATE_FILE.exists())
 
     def test_successful_upload_is_persisted(self):
@@ -61,10 +63,11 @@ class DeduplicationTests(unittest.TestCase):
         cfg = {"dawarich_url": "https://example.test", "dawarich_api_key": "key"}
 
         with patch.object(app.requests, "post", return_value=response):
-            failures = app.push_to_dawarich(cfg, [pending])
+            failures, uploaded = app.push_to_dawarich(cfg, [pending])
 
         state = json.loads(app.IMPORT_STATE_FILE.read_text(encoding="utf-8"))
         self.assertEqual(failures, 0)
+        self.assertEqual(uploaded, [pending])
         self.assertEqual(state["uploaded_files"], [pending.name])
 
     def test_overlap_preview_selects_only_points_inside_corridor(self):
@@ -152,6 +155,72 @@ class DeduplicationTests(unittest.TestCase):
         self.assertEqual(deleted, 2)
         self.assertEqual(delete.call_count, 2)
         self.assertEqual(len(list((app.STATE_DIR / "dedup-backups").glob("*.json"))), 1)
+
+    def test_activity_is_reconstructed_from_saved_gpx(self):
+        gpx_path = self.root / "2026-08-14_19732657015_Test_Run.gpx"
+        gpx_path.write_text(
+            '<gpx><metadata><name>Test Run</name><time>2026-08-14T12:00:00Z</time></metadata>'
+            '<trk><trkseg><trkpt lat="46.8" lon="-71.2">'
+            '<time>2026-08-14T12:05:00Z</time></trkpt></trkseg></trk></gpx>',
+            encoding="utf-8",
+        )
+
+        activity, _ = app.activity_from_gpx_file(gpx_path)
+
+        self.assertEqual(activity["id"], 19732657015)
+        self.assertEqual(activity["name"], "Test Run")
+        self.assertEqual(activity["elapsed_time"], 300)
+
+    def test_wait_requires_visible_gpx_points(self):
+        activity = {
+            "id": 42,
+            "start_date": "2026-08-14T12:00:00Z",
+            "elapsed_time": 60,
+        }
+        points = [{"tracker_id": "gpx-import"}, {"tracker_id": "D5"}]
+
+        with patch.object(app, "fetch_dawarich_points", return_value=points):
+            count = app.wait_for_dawarich_gpx({}, activity, timeout_seconds=0)
+
+        self.assertEqual(count, 1)
+
+    def test_auto_dedup_verifies_after_deletion(self):
+        gpx_path = self.root / "2026-08-14_42_Test.gpx"
+        gpx_path.write_text("<gpx />", encoding="utf-8")
+        activity = {
+            "id": 42,
+            "name": "Test",
+            "start_date": "2026-08-14T12:00:00Z",
+            "elapsed_time": 60,
+        }
+        candidate = {"id": 1, "tracker_id": "D5", "original_point": {"id": 1}}
+
+        with patch.object(app, "activity_from_gpx_file", return_value=(activity, "<gpx />")), \
+                patch.object(app, "wait_for_dawarich_gpx"), \
+                patch.object(
+                    app,
+                    "analyze_dawarich_overlap",
+                    side_effect=[{"candidate_points": [candidate]}, {"candidate_points": []}],
+                ) as analyze, \
+                patch.object(app, "delete_dawarich_candidates") as delete:
+            app.auto_dedup_uploaded_files({}, [gpx_path])
+
+        delete.assert_called_once()
+        self.assertEqual(analyze.call_count, 2)
+
+    def test_auto_dedup_queue_is_removed_only_after_success(self):
+        gpx_path = app.OUTPUT_DIR / "2026-08-14_42_Test.gpx"
+        gpx_path.write_text("<gpx />", encoding="utf-8")
+        app.enqueue_auto_dedup([gpx_path])
+
+        with patch.object(app, "auto_dedup_uploaded_files", side_effect=TimeoutError("slow")):
+            with self.assertRaises(TimeoutError):
+                app.process_auto_dedup_queue({})
+        self.assertEqual(app.load_auto_dedup_queue(), [gpx_path.name])
+
+        with patch.object(app, "auto_dedup_uploaded_files"):
+            app.process_auto_dedup_queue({})
+        self.assertEqual(app.load_auto_dedup_queue(), [])
 
 
 if __name__ == "__main__":
