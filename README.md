@@ -95,6 +95,36 @@ python strava_gpx.py push
 python strava_gpx.py push --dir /path/to/gpx/files
 ```
 
+## Docker
+
+Copy the example environment and choose a persistent host directory:
+
+```bash
+cp .env.example .env
+# For the homelab, set APPDATA_PATH=/tank/appdata/strava-2-dawarich
+docker compose up -d --build
+```
+
+The container stays idle until a command is requested, which keeps failures isolated
+from Dawarich and makes development predictable:
+
+```bash
+docker compose exec strava-2-dawarich python strava_gpx.py auth
+docker compose exec strava-2-dawarich python strava_gpx.py sync --dry-run --days 7
+docker compose exec strava-2-dawarich python strava_gpx.py sync
+```
+
+Persistent files are separated under `state/`, `gpx/`, and `logs/`. Successful
+Dawarich uploads are recorded in `state/dawarich_imports.json`; later pushes skip
+the same filename. This is the first deduplication layer and does not yet query
+Dawarich's own records.
+
+`--dry-run` fetches and evaluates activities but does not write GPX/state files or
+push anything to Dawarich. It is also available on the `push` command.
+
+Console output is also appended to `logs/strava-2-dawarich.log` by default.
+Set `LOG_TO_FILE=false` to disable file logging.
+
 ## Automating with Cron (Unraid User Scripts)
 
 Add a User Script on Unraid to sync on a schedule:
