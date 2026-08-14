@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
 import time
 import webbrowser
@@ -311,6 +312,7 @@ def analyze_dawarich_overlap(
                 "id": point.get("id"),
                 "tracker_id": tracker_id,
                 "distance_m": round(nearest, 1),
+                "original_point": point,
             })
 
     report = {
@@ -342,6 +344,73 @@ def analyze_dawarich_overlap(
         json.dump(report, report_file, indent=2)
     print(f"    Report: {report_path}")
     return report
+
+
+def delete_dawarich_candidates(cfg, report_path, confirmation, max_points=5000, batch_size=500):
+    """Delete candidates from a reviewed report after strict safety checks."""
+    report_path = Path(report_path).resolve()
+    with open(report_path, encoding="utf-8") as report_file:
+        report = json.load(report_file)
+
+    activity_id = str(report.get("activity_id", ""))
+    if str(confirmation) != activity_id:
+        raise ValueError(f"Confirmation must exactly match Strava activity ID {activity_id}")
+
+    candidates = report.get("candidate_points", [])
+    if not candidates:
+        raise ValueError("Report contains no deletion candidates")
+    if len(candidates) > max_points:
+        raise ValueError(
+            f"Report has {len(candidates)} candidates, exceeding safety limit {max_points}"
+        )
+    if report.get("gpx_points_preserved", 0) <= 0:
+        raise ValueError("No imported GPX points were detected; refusing replacement deletion")
+    if any("original_point" not in candidate for candidate in candidates):
+        raise ValueError("Report lacks full point backups; regenerate it with --dedup-dawarich --dry-run")
+
+    allowed_trackers = {
+        value.strip()
+        for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
+        if value.strip()
+    }
+    candidate_trackers = {candidate.get("tracker_id") for candidate in candidates}
+    if not allowed_trackers or not candidate_trackers.issubset(allowed_trackers):
+        raise ValueError(
+            f"Candidate trackers {sorted(candidate_trackers)} are not covered by current allowlist"
+        )
+
+    backup_dir = STATE_DIR / "dedup-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = backup_dir / f"strava-{activity_id}-{timestamp}.json"
+    shutil.copy2(report_path, backup_path)
+    print(f"Backup created: {backup_path}")
+
+    url = f"{cfg['dawarich_url']}/api/v1/points/bulk_destroy"
+    headers = {"Authorization": f"Bearer {cfg['dawarich_api_key']}"}
+    point_ids = [candidate["id"] for candidate in candidates]
+    deleted = 0
+
+    for offset in range(0, len(point_ids), batch_size):
+        batch = point_ids[offset:offset + batch_size]
+        response = requests.delete(
+            url,
+            headers=headers,
+            json={"point_ids": batch},
+            timeout=60,
+        )
+        response.raise_for_status()
+        deleted += len(batch)
+        print(f"Deleted {deleted}/{len(point_ids)} points")
+
+    report["deletion"] = {
+        "deleted_at": datetime.now(timezone.utc).isoformat(),
+        "deleted_points": deleted,
+        "backup_path": str(backup_path),
+    }
+    with open(report_path, "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, indent=2)
+    return deleted
 
 
 # ── OAuth ────────────────────────────────────────────────────────────────────
@@ -961,6 +1030,16 @@ def parse_args():
     push_parser.add_argument("--dir", type=str, help="Directory of GPX files (default: gpx_output/)")
     push_parser.add_argument("--dry-run", action="store_true", help="Preview uploads without changing Dawarich")
 
+    dedup_parser = sub.add_parser(
+        "dedup", help="Delete reviewed Dawarich candidates from one saved report"
+    )
+    dedup_parser.add_argument("--report", required=True, help="Path to a reviewed dedup report")
+    dedup_parser.add_argument(
+        "--confirm-delete",
+        required=True,
+        help="Exact Strava activity ID required to authorize deletion",
+    )
+
     return parser.parse_args()
 
 
@@ -1036,8 +1115,26 @@ def main():
             sys.exit(1)
         return
 
+    if args.command == "dedup":
+        cfg = load_config()
+        max_points = int(os.environ.get("DAWARICH_DEDUP_MAX_POINTS", "5000"))
+        batch_size = int(os.environ.get("DAWARICH_DEDUP_BATCH_SIZE", "500"))
+        try:
+            deleted = delete_dawarich_candidates(
+                cfg,
+                args.report,
+                args.confirm_delete,
+                max_points=max_points,
+                batch_size=batch_size,
+            )
+        except (OSError, ValueError, requests.RequestException) as exc:
+            print(f"Deduplication aborted: {exc}")
+            sys.exit(1)
+        print(f"Deduplication complete: {deleted} legacy Dawarich points deleted.")
+        return
+
     # No command given
-    print("Usage: python strava_gpx.py {setup|auth|sync|push}")
+    print("Usage: python strava_gpx.py {setup|auth|sync|push|dedup}")
     print("Run with --help for details.")
 
 

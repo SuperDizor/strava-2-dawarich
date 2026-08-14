@@ -153,6 +153,20 @@ always preserved. JSON reports are written to
 `state/dedup-reports/strava-<activity-id>.json`. This release never sends a
 DELETE request; `--dedup-dawarich` is rejected unless `--dry-run` is also set.
 
+After manually reviewing a newly generated report, one activity can be cleaned
+with an explicit activity-ID confirmation:
+
+```bash
+docker compose exec strava-2-dawarich python strava_gpx.py dedup \
+  --report /data/state/dedup-reports/strava-19732657015.json \
+  --confirm-delete 19732657015
+```
+
+The command refuses reports without full point backups, without existing GPX
+points, above `DAWARICH_DEDUP_MAX_POINTS`, or containing trackers outside the
+current allowlist. It copies the reviewed report to `state/dedup-backups/`
+before deleting in bounded batches. Deduplication is never run by `sync` or cron.
+
 ## Automating with Cron (Unraid User Scripts)
 
 Add a User Script on Unraid to sync on a schedule:

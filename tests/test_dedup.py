@@ -12,6 +12,7 @@ requests_stub = types.ModuleType("requests")
 requests_stub.RequestException = Exception
 requests_stub.post = lambda *args, **kwargs: None
 requests_stub.get = lambda *args, **kwargs: None
+requests_stub.delete = lambda *args, **kwargs: None
 sys.modules.setdefault("requests", requests_stub)
 
 MODULE_PATH = Path(__file__).parents[1] / "strava_gpx.py"
@@ -120,6 +121,37 @@ class DeduplicationTests(unittest.TestCase):
             app.sync({}, after_timestamp=0, dry_run=True, dedup_dawarich=True)
 
         analyze.assert_called_once()
+
+    def test_delete_requires_exact_activity_confirmation(self):
+        report_path = self.root / "report.json"
+        report_path.write_text(json.dumps({"activity_id": 42}), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            app.delete_dawarich_candidates({}, report_path, confirmation="wrong")
+
+    def test_delete_creates_backup_and_batches_allowed_candidates(self):
+        report_path = self.root / "report.json"
+        report = {
+            "activity_id": 42,
+            "gpx_points_preserved": 100,
+            "candidate_points": [
+                {"id": 1, "tracker_id": "D5", "original_point": {"id": 1}},
+                {"id": 2, "tracker_id": "D5", "original_point": {"id": 2}},
+            ],
+        }
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        cfg = {"dawarich_url": "https://example.test", "dawarich_api_key": "key"}
+        response = types.SimpleNamespace(raise_for_status=lambda: None)
+
+        with patch.dict(app.os.environ, {"DAWARICH_DEDUP_TRACKER_IDS": "D5"}), \
+                patch.object(app.requests, "delete", return_value=response) as delete:
+            deleted = app.delete_dawarich_candidates(
+                cfg, report_path, confirmation="42", batch_size=1
+            )
+
+        self.assertEqual(deleted, 2)
+        self.assertEqual(delete.call_count, 2)
+        self.assertEqual(len(list((app.STATE_DIR / "dedup-backups").glob("*.json"))), 1)
 
 
 if __name__ == "__main__":
