@@ -26,9 +26,11 @@ class DeduplicationTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         app.STATE_DIR = self.root / "state"
+        app.STATE_FILE = app.STATE_DIR / "state.json"
         app.OUTPUT_DIR = self.root / "gpx"
         app.IMPORT_STATE_FILE = app.STATE_DIR / "dawarich_imports.json"
         app.AUTO_DEDUP_QUEUE_FILE = app.STATE_DIR / "auto_dedup_queue.json"
+        app.BACKFILL_STATE_FILE = app.STATE_DIR / "backfill_state.json"
         app.DEDUP_REPORT_DIR = app.STATE_DIR / "dedup-reports"
         app.OUTPUT_DIR.mkdir()
 
@@ -221,6 +223,44 @@ class DeduplicationTests(unittest.TestCase):
         with patch.object(app, "auto_dedup_uploaded_files"):
             app.process_auto_dedup_queue({})
         self.assertEqual(app.load_auto_dedup_queue(), [])
+
+    def test_backfill_checkpoints_each_activity_and_resumes(self):
+        activities = [
+            {"id": value, "start_date": f"2024-01-0{value}T12:00:00Z", "name": str(value)}
+            for value in (1, 2, 3)
+        ]
+        app.save_state({"fetched_ids": [1]})
+
+        with patch.object(app, "get_token", return_value={"access_token": "token"}), \
+                patch.object(app, "get_activities", return_value=activities), \
+                patch.object(app, "process_backfill_activity", return_value="imported") as process:
+            first = app.run_backfill(
+                {}, date_from="2024-01-01", date_to="2024-01-31", batch_size=2
+            )
+            second = app.run_backfill({}, resume=True)
+
+        self.assertEqual(first["status"], "active")
+        self.assertEqual(second["status"], "complete")
+        self.assertEqual(second["completed_ids"], [1, 2, 3])
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual(app.load_state()["fetched_ids"], [1, 2, 3])
+
+    def test_rate_guard_preserves_configured_reserve(self):
+        response = types.SimpleNamespace(
+            headers={
+                "X-ReadRateLimit-Limit": "100,1000",
+                "X-ReadRateLimit-Usage": "90,500",
+            }
+        )
+        app.BACKFILL_RATE_GUARD = True
+        app.BACKFILL_RATE_PAUSE_REASON = None
+        try:
+            app.update_strava_rate_guard(response)
+            with self.assertRaises(app.BackfillRateLimit):
+                app.strava_request("GET", "https://example.test", "token")
+        finally:
+            app.BACKFILL_RATE_GUARD = False
+            app.BACKFILL_RATE_PAUSE_REASON = None
 
 
 if __name__ == "__main__":

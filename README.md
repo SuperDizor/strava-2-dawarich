@@ -190,6 +190,33 @@ non-zero so cron records a failure. The GPX remains in
 from the queue only after successful post-delete verification. Manual `push`
 never triggers auto-dedup.
 
+### Resumable historical backfill
+
+Historical imports run in bounded batches and checkpoint after every completed
+activity. The end date is inclusive:
+
+```bash
+docker compose exec strava-2-dawarich python strava_gpx.py backfill \
+  --from 2024-01-01 --to 2024-12-31 --batch-size 50
+```
+
+Continue the same period with:
+
+```bash
+docker compose exec strava-2-dawarich \
+  python strava_gpx.py backfill --resume
+```
+
+State is stored atomically in `state/backfill_state.json`. Each activity is
+fully processed through GPX creation, Dawarich upload, optional automatic
+deduplication, and verification before its checkpoint is committed. Existing
+`fetched_ids` and GPX points already visible in Dawarich are skipped safely.
+
+During backfill, Strava's `X-ReadRateLimit-*` headers are monitored. Processing
+pauses before consuming `STRAVA_BACKFILL_15MIN_RESERVE` or
+`STRAVA_BACKFILL_DAILY_RESERVE`; resume after the indicated reset. This avoids
+using the request capacity needed by normal scheduled syncs.
+
 ## Automating with Cron (Unraid User Scripts)
 
 Add a User Script on Unraid to sync on a schedule:
