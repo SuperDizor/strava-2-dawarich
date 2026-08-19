@@ -210,7 +210,8 @@ class DeduplicationTests(unittest.TestCase):
         }
         candidate = {"id": 1, "tracker_id": "D5", "original_point": {"id": 1}}
 
-        with patch.object(app, "activity_from_gpx_file", return_value=(activity, "<gpx />")), \
+        with patch.dict(app.os.environ, {"DAWARICH_DEDUP_TRACKER_IDS": "D5"}), \
+                patch.object(app, "activity_from_gpx_file", return_value=(activity, "<gpx />")), \
                 patch.object(app, "wait_for_dawarich_gpx"), \
                 patch.object(
                     app,
@@ -222,6 +223,11 @@ class DeduplicationTests(unittest.TestCase):
 
         delete.assert_called_once()
         self.assertEqual(analyze.call_count, 2)
+
+    def test_auto_dedup_requires_explicit_tracker_allowlist(self):
+        with patch.dict(app.os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "safety allowlist"):
+                app.auto_dedup_uploaded_files({}, [])
 
     def test_auto_dedup_queue_is_removed_only_after_success(self):
         gpx_path = app.OUTPUT_DIR / "2026-08-14_42_Test.gpx"
@@ -312,10 +318,11 @@ class DeduplicationTests(unittest.TestCase):
                 encoding="utf-8",
             )
         reports = [
-            {"gpx_points_preserved": 10, "candidate_points": [
+            {"gpx_points_preserved": 10, "tracker_summary": {"gpx-a": 10, "D5": 1},
+             "candidate_points": [
                 {"tracker_id": "D5"}
             ]},
-            {"gpx_points_preserved": 0, "candidate_points": []},
+            {"gpx_points_preserved": 0, "tracker_summary": {}, "candidate_points": []},
         ]
         with patch.dict(app.os.environ, {"DAWARICH_DEDUP_TRACKER_IDS": "D5,google-phone-1"}), \
                 patch.object(app, "analyze_dawarich_overlap", side_effect=reports):
@@ -327,6 +334,7 @@ class DeduplicationTests(unittest.TestCase):
         self.assertEqual(second["totals"]["audited_activities"], 2)
         self.assertEqual(second["totals"]["activities_missing_in_dawarich"], 1)
         self.assertEqual(second["totals"]["dedup_candidates"], 1)
+        self.assertEqual(second["totals"]["observed_tracker_points"]["D5"], 1)
         self.assertTrue(app.AUDIT_REPORT_FILE.exists())
 
 

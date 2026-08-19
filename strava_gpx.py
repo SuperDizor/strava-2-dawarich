@@ -266,6 +266,15 @@ def is_dawarich_gpx_tracker(tracker_id):
     )
 
 
+def configured_dedup_tracker_ids():
+    """Return the explicit safety allowlist for destructive deduplication."""
+    return {
+        value.strip()
+        for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
+        if value.strip()
+    }
+
+
 def fetch_dawarich_points(cfg, start_timestamp, end_timestamp):
     """Fetch every Dawarich point in a Unix timestamp window."""
     url = f"{cfg['dawarich_url']}/api/v1/points"
@@ -310,11 +319,7 @@ def analyze_dawarich_overlap(
     track = gpx_coordinates(gpx_xml)
     points = fetch_dawarich_points(cfg, start, end)
     if allowed_tracker_ids is None:
-        allowed_tracker_ids = {
-            value.strip()
-            for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
-            if value.strip()
-        }
+        allowed_tracker_ids = configured_dedup_tracker_ids()
     else:
         allowed_tracker_ids = set(allowed_tracker_ids)
     candidates = []
@@ -399,11 +404,7 @@ def delete_dawarich_candidates(cfg, report_path, confirmation, max_points=5000, 
     if any("original_point" not in candidate for candidate in candidates):
         raise ValueError("Report lacks full point backups; regenerate it with --dedup-dawarich --dry-run")
 
-    allowed_trackers = {
-        value.strip()
-        for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
-        if value.strip()
-    }
+    allowed_trackers = configured_dedup_tracker_ids()
     candidate_trackers = {candidate.get("tracker_id") for candidate in candidates}
     if not allowed_trackers or not candidate_trackers.issubset(allowed_trackers):
         raise ValueError(
@@ -509,6 +510,10 @@ def wait_for_dawarich_gpx(cfg, activity, timeout_seconds=300, interval_seconds=1
 
 def auto_dedup_uploaded_files(cfg, gpx_files):
     """Safely deduplicate newly uploaded GPX files when explicitly enabled."""
+    if not configured_dedup_tracker_ids():
+        raise ValueError(
+            "DAWARICH_AUTO_DEDUP requires DAWARICH_DEDUP_TRACKER_IDS as a safety allowlist"
+        )
     radius = int(os.environ.get("DAWARICH_DEDUP_RADIUS_METERS", "200"))
     max_points = int(os.environ.get("DAWARICH_AUTO_DEDUP_MAX_POINTS", "5000"))
     batch_size = int(os.environ.get("DAWARICH_DEDUP_BATCH_SIZE", "500"))
@@ -1417,11 +1422,7 @@ def run_audit(cfg, batch_size=20, resume=False):
     completed = set(state.get("completed_files", []))
     remaining = [path for path in files if path.name not in completed]
     selected = remaining[:batch_size]
-    allowed = {
-        value.strip()
-        for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
-        if value.strip()
-    }
+    allowed = configured_dedup_tracker_ids()
     radius = int(os.environ.get("DAWARICH_DEDUP_RADIUS_METERS", "200"))
 
     print(
@@ -1440,6 +1441,7 @@ def run_audit(cfg, batch_size=20, resume=False):
             "filename": gpx_path.name,
             "gpx_points": report["gpx_points_preserved"],
             "dedup_candidates": len(report["candidate_points"]),
+            "tracker_summary": report["tracker_summary"],
             "candidate_tracker_counts": dict(sorted(
                 {
                     tracker: sum(
@@ -1467,7 +1469,16 @@ def run_audit(cfg, batch_size=20, resume=False):
         "dedup_candidates": sum(
             item["dedup_candidates"] for item in state["activities"]
         ),
+        "observed_tracker_points": {},
     }
+    for item in state["activities"]:
+        for tracker, count in item.get("tracker_summary", {}).items():
+            totals["observed_tracker_points"][tracker] = (
+                totals["observed_tracker_points"].get(tracker, 0) + count
+            )
+    totals["observed_tracker_points"] = dict(
+        sorted(totals["observed_tracker_points"].items())
+    )
     state["totals"] = totals
     state["status"] = "complete" if len(remaining) <= len(selected) else "active"
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1565,10 +1576,6 @@ def main():
         if args.dedup_dawarich and not cfg.get("dawarich_url"):
             print("Dawarich must be configured for --dedup-dawarich.")
             sys.exit(2)
-        if args.dedup_dawarich and not os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").strip():
-            print("Set DAWARICH_DEDUP_TRACKER_IDS to the tracker IDs allowed for deduplication.")
-            sys.exit(2)
-
         after = None
         if args.all:
             after = 0
@@ -1677,9 +1684,6 @@ def main():
             sys.exit(2)
         if args.batch_size < 1:
             print("--batch-size must be at least 1.")
-            sys.exit(2)
-        if not os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").strip():
-            print("Set DAWARICH_DEDUP_TRACKER_IDS before running the audit.")
             sys.exit(2)
         try:
             run_audit(cfg, batch_size=args.batch_size, resume=args.resume)
