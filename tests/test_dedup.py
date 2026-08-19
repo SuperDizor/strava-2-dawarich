@@ -31,6 +31,8 @@ class DeduplicationTests(unittest.TestCase):
         app.IMPORT_STATE_FILE = app.STATE_DIR / "dawarich_imports.json"
         app.AUTO_DEDUP_QUEUE_FILE = app.STATE_DIR / "auto_dedup_queue.json"
         app.BACKFILL_STATE_FILE = app.STATE_DIR / "backfill_state.json"
+        app.AUDIT_STATE_FILE = app.STATE_DIR / "audit_state.json"
+        app.AUDIT_REPORT_FILE = app.STATE_DIR / "audit-report.json"
         app.DEDUP_REPORT_DIR = app.STATE_DIR / "dedup-reports"
         app.OUTPUT_DIR.mkdir()
 
@@ -299,6 +301,33 @@ class DeduplicationTests(unittest.TestCase):
             result = app.process_backfill_activity({}, "token", activity)
 
         self.assertEqual(result, "imported")
+
+    def test_audit_is_checkpointed_and_resumable(self):
+        for activity_id in (41, 42):
+            path = app.OUTPUT_DIR / f"2026-08-14_{activity_id}_Test.gpx"
+            path.write_text(
+                '<gpx><metadata><time>2026-08-14T12:00:00Z</time></metadata>'
+                '<trk><trkseg><trkpt lat="46.8" lon="-71.2">'
+                '<time>2026-08-14T12:01:00Z</time></trkpt></trkseg></trk></gpx>',
+                encoding="utf-8",
+            )
+        reports = [
+            {"gpx_points_preserved": 10, "candidate_points": [
+                {"tracker_id": "D5"}
+            ]},
+            {"gpx_points_preserved": 0, "candidate_points": []},
+        ]
+        with patch.dict(app.os.environ, {"DAWARICH_DEDUP_TRACKER_IDS": "D5,google-phone-1"}), \
+                patch.object(app, "analyze_dawarich_overlap", side_effect=reports):
+            first = app.run_audit({}, batch_size=1)
+            second = app.run_audit({}, batch_size=1, resume=True)
+
+        self.assertEqual(first["status"], "active")
+        self.assertEqual(second["status"], "complete")
+        self.assertEqual(second["totals"]["audited_activities"], 2)
+        self.assertEqual(second["totals"]["activities_missing_in_dawarich"], 1)
+        self.assertEqual(second["totals"]["dedup_candidates"], 1)
+        self.assertTrue(app.AUDIT_REPORT_FILE.exists())
 
 
 if __name__ == "__main__":

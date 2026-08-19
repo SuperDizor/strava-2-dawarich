@@ -34,6 +34,8 @@ TOKEN_FILE = STATE_DIR / "token.json"
 IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
 AUTO_DEDUP_QUEUE_FILE = STATE_DIR / "auto_dedup_queue.json"
 BACKFILL_STATE_FILE = STATE_DIR / "backfill_state.json"
+AUDIT_STATE_FILE = STATE_DIR / "audit_state.json"
+AUDIT_REPORT_FILE = STATE_DIR / "audit-report.json"
 DEDUP_REPORT_DIR = Path(os.environ.get("DAWARICH_DEDUP_REPORT_DIR", STATE_DIR / "dedup-reports")).resolve()
 
 STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
@@ -58,7 +60,8 @@ def configure_runtime_paths():
     """Refresh storage paths after values from .env have been loaded."""
     global DATA_DIR, STATE_DIR, OUTPUT_DIR, LOG_DIR
     global CONFIG_FILE, STATE_FILE, TOKEN_FILE, IMPORT_STATE_FILE
-    global AUTO_DEDUP_QUEUE_FILE, BACKFILL_STATE_FILE, DEDUP_REPORT_DIR
+    global AUTO_DEDUP_QUEUE_FILE, BACKFILL_STATE_FILE, AUDIT_STATE_FILE
+    global AUDIT_REPORT_FILE, DEDUP_REPORT_DIR
     DATA_DIR = Path(os.environ.get("DATA_DIR", SCRIPT_DIR)).resolve()
     STATE_DIR = Path(os.environ.get("STATE_DIR", DATA_DIR)).resolve()
     OUTPUT_DIR = Path(os.environ.get("GPX_DIR", DATA_DIR / "gpx_output")).resolve()
@@ -69,6 +72,8 @@ def configure_runtime_paths():
     IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
     AUTO_DEDUP_QUEUE_FILE = STATE_DIR / "auto_dedup_queue.json"
     BACKFILL_STATE_FILE = STATE_DIR / "backfill_state.json"
+    AUDIT_STATE_FILE = STATE_DIR / "audit_state.json"
+    AUDIT_REPORT_FILE = STATE_DIR / "audit-report.json"
     DEDUP_REPORT_DIR = Path(
         os.environ.get("DAWARICH_DEDUP_REPORT_DIR", STATE_DIR / "dedup-reports")
     ).resolve()
@@ -1392,6 +1397,88 @@ def run_backfill(cfg, date_from=None, date_to=None, batch_size=50, resume=False)
         BACKFILL_RATE_PAUSE_REASON = None
 
 
+def run_audit(cfg, batch_size=20, resume=False):
+    """Audit saved GPX activities against Dawarich without changing remote data."""
+    if resume:
+        if not AUDIT_STATE_FILE.exists():
+            raise ValueError("No audit state exists to resume")
+        with open(AUDIT_STATE_FILE, encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    else:
+        state = {
+            "version": 1,
+            "status": "active",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "completed_files": [],
+            "activities": [],
+        }
+
+    files = sorted(OUTPUT_DIR.glob("*.gpx"))
+    completed = set(state.get("completed_files", []))
+    remaining = [path for path in files if path.name not in completed]
+    selected = remaining[:batch_size]
+    allowed = {
+        value.strip()
+        for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
+        if value.strip()
+    }
+    radius = int(os.environ.get("DAWARICH_DEDUP_RADIUS_METERS", "200"))
+
+    print(
+        f"Audit: {len(files)} local GPX files, {len(remaining)} remaining, "
+        f"checking up to {len(selected)}"
+    )
+    for index, gpx_path in enumerate(selected, 1):
+        activity, gpx_xml = activity_from_gpx_file(gpx_path)
+        print(f"  [{index}/{len(selected)}] {gpx_path.name}")
+        report = analyze_dawarich_overlap(
+            cfg, activity, gpx_xml, radius_meters=radius,
+            allowed_tracker_ids=allowed,
+        )
+        state["activities"].append({
+            "activity_id": activity["id"],
+            "filename": gpx_path.name,
+            "gpx_points": report["gpx_points_preserved"],
+            "dedup_candidates": len(report["candidate_points"]),
+            "candidate_tracker_counts": dict(sorted(
+                {
+                    tracker: sum(
+                        1 for candidate in report["candidate_points"]
+                        if candidate.get("tracker_id") == tracker
+                    )
+                    for tracker in allowed
+                }.items()
+            )),
+        })
+        completed.add(gpx_path.name)
+        state["completed_files"] = sorted(completed)
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        save_json_atomic(AUDIT_STATE_FILE, state)
+
+    totals = {
+        "local_gpx_files": len(files),
+        "audited_activities": len(state["activities"]),
+        "activities_missing_in_dawarich": sum(
+            1 for item in state["activities"] if item["gpx_points"] == 0
+        ),
+        "activities_with_candidates": sum(
+            1 for item in state["activities"] if item["dedup_candidates"] > 0
+        ),
+        "dedup_candidates": sum(
+            item["dedup_candidates"] for item in state["activities"]
+        ),
+    }
+    state["totals"] = totals
+    state["status"] = "complete" if len(remaining) <= len(selected) else "active"
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save_json_atomic(AUDIT_STATE_FILE, state)
+    save_json_atomic(AUDIT_REPORT_FILE, state)
+    print(f"Audit status: {state['status']}")
+    print(f"Summary: {totals}")
+    print(f"Report: {AUDIT_REPORT_FILE}")
+    return state
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -1440,6 +1527,16 @@ def parse_args():
     )
     backfill_parser.add_argument(
         "--resume", action="store_true", help="Resume the existing checkpointed backfill"
+    )
+
+    audit_parser = sub.add_parser(
+        "audit", help="Audit local GPX imports and legacy overlap without deleting points"
+    )
+    audit_parser.add_argument(
+        "--batch-size", type=int, default=20, help="Maximum GPX files per invocation"
+    )
+    audit_parser.add_argument(
+        "--resume", action="store_true", help="Resume the existing audit checkpoint"
     )
 
     return parser.parse_args()
@@ -1573,8 +1670,27 @@ def main():
             print("Run the same command with --resume after the indicated reset.")
         return
 
+    if args.command == "audit":
+        cfg = load_config()
+        if not cfg.get("dawarich_url") or not cfg.get("dawarich_api_key"):
+            print("Dawarich must be configured for audit.")
+            sys.exit(2)
+        if args.batch_size < 1:
+            print("--batch-size must be at least 1.")
+            sys.exit(2)
+        if not os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").strip():
+            print("Set DAWARICH_DEDUP_TRACKER_IDS before running the audit.")
+            sys.exit(2)
+        try:
+            run_audit(cfg, batch_size=args.batch_size, resume=args.resume)
+        except (OSError, ValueError, requests.RequestException) as exc:
+            print(f"Audit failed safely: {exc}")
+            print(f"Checkpoint: {AUDIT_STATE_FILE}")
+            sys.exit(1)
+        return
+
     # No command given
-    print("Usage: python strava_gpx.py {setup|auth|sync|push|dedup|backfill}")
+    print("Usage: python strava_gpx.py {setup|auth|sync|push|dedup|backfill|audit}")
     print("Run with --help for details.")
 
 

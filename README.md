@@ -222,6 +222,22 @@ Dawarich exposes no GPX points in that activity window, `--resume` clears the
 orphaned marker and re-uploads the file. This recovery happens only after a
 complete Dawarich point query confirms the GPX is absent.
 
+### Read-only historical audit
+
+Audit saved GPX activities in bounded batches after a large backfill:
+
+```bash
+docker compose exec -T strava-2-dawarich \
+  python strava_gpx.py audit --batch-size 20
+```
+
+Continue with `python strava_gpx.py audit --resume`. The audit never deletes
+remote data. It verifies that Dawarich exposes imported GPX points and reports
+legacy points from `DAWARICH_DEDUP_TRACKER_IDS` within the configured corridor.
+Progress is stored in `state/audit_state.json`, the aggregate result in
+`state/audit-report.json`, and reviewed per-activity reports remain in
+`state/dedup-reports/` for the separately confirmed `dedup` command.
+
 ## Automating with Cron (Unraid User Scripts)
 
 Add a User Script on Unraid to sync on a schedule:
