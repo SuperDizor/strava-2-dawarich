@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -252,6 +253,14 @@ def point_coordinates(point):
     return float(latitude), float(longitude)
 
 
+def is_dawarich_gpx_tracker(tracker_id):
+    """Recognize GPX tracker IDs emitted by supported Dawarich versions."""
+    tracker_id = tracker_id or ""
+    return tracker_id.startswith("gpx-") or bool(
+        re.match(r"^import-\d+-trk-", tracker_id)
+    )
+
+
 def fetch_dawarich_points(cfg, start_timestamp, end_timestamp):
     """Fetch every Dawarich point in a Unix timestamp window."""
     url = f"{cfg['dawarich_url']}/api/v1/points"
@@ -312,7 +321,7 @@ def analyze_dawarich_overlap(
     for point in points:
         tracker_id = point.get("tracker_id") or "<none>"
         tracker_summary[tracker_id] = tracker_summary.get(tracker_id, 0) + 1
-        if tracker_id.startswith("gpx-"):
+        if is_dawarich_gpx_tracker(tracker_id):
             gpx_preserved += 1
             continue
         if tracker_id not in allowed_tracker_ids:
@@ -479,7 +488,7 @@ def wait_for_dawarich_gpx(cfg, activity, timeout_seconds=300, interval_seconds=1
     while True:
         points = fetch_dawarich_points(cfg, start, end)
         gpx_count = sum(
-            1 for point in points if (point.get("tracker_id") or "").startswith("gpx-")
+            1 for point in points if is_dawarich_gpx_tracker(point.get("tracker_id"))
         )
         if gpx_count:
             print(f"    Dawarich GPX processing confirmed: {gpx_count} points")
@@ -1226,7 +1235,7 @@ def dawarich_gpx_count(cfg, activity):
     start = int(datetime.fromisoformat(activity["start_date"].replace("Z", "+00:00")).timestamp())
     end = start + int(activity.get("elapsed_time", 0))
     points = fetch_dawarich_points(cfg, start, end)
-    return sum(1 for point in points if (point.get("tracker_id") or "").startswith("gpx-"))
+    return sum(1 for point in points if is_dawarich_gpx_tracker(point.get("tracker_id")))
 
 
 def process_backfill_activity(cfg, access_token, activity):

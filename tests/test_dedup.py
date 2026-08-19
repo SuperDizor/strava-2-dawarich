@@ -89,7 +89,9 @@ class DeduplicationTests(unittest.TestCase):
             {"id": 1, "lat": 46.8001, "lng": -71.2001, "tracker_id": "D5"},
             {"id": 2, "lat": 46.9000, "lng": -71.3000, "tracker_id": "D5"},
             {"id": 3, "lat": 46.8001, "lng": -71.2001, "tracker_id": "gpx-import"},
-            {"id": 4, "lat": 46.8001, "lng": -71.2001, "tracker_id": "OTHER"},
+            {"id": 4, "lat": 46.8001, "lng": -71.2001,
+             "tracker_id": "import-619-trk-0-seg-0"},
+            {"id": 5, "lat": 46.8001, "lng": -71.2001, "tracker_id": "OTHER"},
         ]
 
         with patch.object(app, "fetch_dawarich_points", return_value=points):
@@ -99,7 +101,7 @@ class DeduplicationTests(unittest.TestCase):
 
         self.assertEqual([point["id"] for point in report["candidate_points"]], [1])
         self.assertEqual(report["outside_corridor"], 1)
-        self.assertEqual(report["gpx_points_preserved"], 1)
+        self.assertEqual(report["gpx_points_preserved"], 2)
         self.assertEqual(report["unapproved_tracker_points_preserved"], 1)
         self.assertTrue((app.DEDUP_REPORT_DIR / "strava-42.json").exists())
 
@@ -179,12 +181,21 @@ class DeduplicationTests(unittest.TestCase):
             "start_date": "2026-08-14T12:00:00Z",
             "elapsed_time": 60,
         }
-        points = [{"tracker_id": "gpx-import"}, {"tracker_id": "D5"}]
+        points = [
+            {"tracker_id": "import-619-trk-0-seg-0"},
+            {"tracker_id": "D5"},
+        ]
 
         with patch.object(app, "fetch_dawarich_points", return_value=points):
             count = app.wait_for_dawarich_gpx({}, activity, timeout_seconds=0)
 
         self.assertEqual(count, 1)
+
+    def test_only_dawarich_import_trackers_are_treated_as_gpx(self):
+        self.assertTrue(app.is_dawarich_gpx_tracker("gpx-abc-trk-0-seg-0"))
+        self.assertTrue(app.is_dawarich_gpx_tracker("import-619-trk-0-seg-0"))
+        self.assertFalse(app.is_dawarich_gpx_tracker("google-phone-1"))
+        self.assertFalse(app.is_dawarich_gpx_tracker("imported-phone"))
 
     def test_auto_dedup_verifies_after_deletion(self):
         gpx_path = self.root / "2026-08-14_42_Test.gpx"
