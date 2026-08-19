@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -32,6 +33,9 @@ STATE_FILE = STATE_DIR / "state.json"
 TOKEN_FILE = STATE_DIR / "token.json"
 IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
 AUTO_DEDUP_QUEUE_FILE = STATE_DIR / "auto_dedup_queue.json"
+BACKFILL_STATE_FILE = STATE_DIR / "backfill_state.json"
+AUDIT_STATE_FILE = STATE_DIR / "audit_state.json"
+AUDIT_REPORT_FILE = STATE_DIR / "audit-report.json"
 DEDUP_REPORT_DIR = Path(os.environ.get("DAWARICH_DEDUP_REPORT_DIR", STATE_DIR / "dedup-reports")).resolve()
 
 STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
@@ -56,7 +60,8 @@ def configure_runtime_paths():
     """Refresh storage paths after values from .env have been loaded."""
     global DATA_DIR, STATE_DIR, OUTPUT_DIR, LOG_DIR
     global CONFIG_FILE, STATE_FILE, TOKEN_FILE, IMPORT_STATE_FILE
-    global AUTO_DEDUP_QUEUE_FILE, DEDUP_REPORT_DIR
+    global AUTO_DEDUP_QUEUE_FILE, BACKFILL_STATE_FILE, AUDIT_STATE_FILE
+    global AUDIT_REPORT_FILE, DEDUP_REPORT_DIR
     DATA_DIR = Path(os.environ.get("DATA_DIR", SCRIPT_DIR)).resolve()
     STATE_DIR = Path(os.environ.get("STATE_DIR", DATA_DIR)).resolve()
     OUTPUT_DIR = Path(os.environ.get("GPX_DIR", DATA_DIR / "gpx_output")).resolve()
@@ -66,6 +71,9 @@ def configure_runtime_paths():
     TOKEN_FILE = STATE_DIR / "token.json"
     IMPORT_STATE_FILE = STATE_DIR / "dawarich_imports.json"
     AUTO_DEDUP_QUEUE_FILE = STATE_DIR / "auto_dedup_queue.json"
+    BACKFILL_STATE_FILE = STATE_DIR / "backfill_state.json"
+    AUDIT_STATE_FILE = STATE_DIR / "audit_state.json"
+    AUDIT_REPORT_FILE = STATE_DIR / "audit-report.json"
     DEDUP_REPORT_DIR = Path(
         os.environ.get("DAWARICH_DEDUP_REPORT_DIR", STATE_DIR / "dedup-reports")
     ).resolve()
@@ -206,6 +214,18 @@ def save_import_state(uploaded_files):
         json.dump({"uploaded_files": sorted(uploaded_files)}, f, indent=2)
 
 
+def clear_orphaned_upload_marker(filename):
+    """Allow a verified-missing GPX to be uploaded again on backfill resume."""
+    uploaded_files = load_import_state()
+    uploaded_files.discard(filename)
+    save_import_state(uploaded_files)
+
+    queue = load_auto_dedup_queue()
+    if filename in queue:
+        queue.remove(filename)
+        save_auto_dedup_queue(queue)
+
+
 # ── Dawarich deduplication preview ──────────────────────────────────────────
 
 def haversine_meters(lat1, lon1, lat2, lon2):
@@ -236,6 +256,23 @@ def point_coordinates(point):
     if latitude is None or longitude is None:
         return None
     return float(latitude), float(longitude)
+
+
+def is_dawarich_gpx_tracker(tracker_id):
+    """Recognize GPX tracker IDs emitted by supported Dawarich versions."""
+    tracker_id = tracker_id or ""
+    return tracker_id.startswith("gpx-") or bool(
+        re.match(r"^import-\d+-trk-", tracker_id)
+    )
+
+
+def configured_dedup_tracker_ids():
+    """Return the explicit safety allowlist for destructive deduplication."""
+    return {
+        value.strip()
+        for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
+        if value.strip()
+    }
 
 
 def fetch_dawarich_points(cfg, start_timestamp, end_timestamp):
@@ -282,11 +319,7 @@ def analyze_dawarich_overlap(
     track = gpx_coordinates(gpx_xml)
     points = fetch_dawarich_points(cfg, start, end)
     if allowed_tracker_ids is None:
-        allowed_tracker_ids = {
-            value.strip()
-            for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
-            if value.strip()
-        }
+        allowed_tracker_ids = configured_dedup_tracker_ids()
     else:
         allowed_tracker_ids = set(allowed_tracker_ids)
     candidates = []
@@ -298,7 +331,7 @@ def analyze_dawarich_overlap(
     for point in points:
         tracker_id = point.get("tracker_id") or "<none>"
         tracker_summary[tracker_id] = tracker_summary.get(tracker_id, 0) + 1
-        if tracker_id.startswith("gpx-"):
+        if is_dawarich_gpx_tracker(tracker_id):
             gpx_preserved += 1
             continue
         if tracker_id not in allowed_tracker_ids:
@@ -371,11 +404,7 @@ def delete_dawarich_candidates(cfg, report_path, confirmation, max_points=5000, 
     if any("original_point" not in candidate for candidate in candidates):
         raise ValueError("Report lacks full point backups; regenerate it with --dedup-dawarich --dry-run")
 
-    allowed_trackers = {
-        value.strip()
-        for value in os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").split(",")
-        if value.strip()
-    }
+    allowed_trackers = configured_dedup_tracker_ids()
     candidate_trackers = {candidate.get("tracker_id") for candidate in candidates}
     if not allowed_trackers or not candidate_trackers.issubset(allowed_trackers):
         raise ValueError(
@@ -465,7 +494,7 @@ def wait_for_dawarich_gpx(cfg, activity, timeout_seconds=300, interval_seconds=1
     while True:
         points = fetch_dawarich_points(cfg, start, end)
         gpx_count = sum(
-            1 for point in points if (point.get("tracker_id") or "").startswith("gpx-")
+            1 for point in points if is_dawarich_gpx_tracker(point.get("tracker_id"))
         )
         if gpx_count:
             print(f"    Dawarich GPX processing confirmed: {gpx_count} points")
@@ -481,6 +510,10 @@ def wait_for_dawarich_gpx(cfg, activity, timeout_seconds=300, interval_seconds=1
 
 def auto_dedup_uploaded_files(cfg, gpx_files):
     """Safely deduplicate newly uploaded GPX files when explicitly enabled."""
+    if not configured_dedup_tracker_ids():
+        raise ValueError(
+            "DAWARICH_AUTO_DEDUP requires DAWARICH_DEDUP_TRACKER_IDS as a safety allowlist"
+        )
     radius = int(os.environ.get("DAWARICH_DEDUP_RADIUS_METERS", "200"))
     max_points = int(os.environ.get("DAWARICH_AUTO_DEDUP_MAX_POINTS", "5000"))
     batch_size = int(os.environ.get("DAWARICH_DEDUP_BATCH_SIZE", "500"))
@@ -661,13 +694,51 @@ def get_token(cfg):
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
 
+BACKFILL_RATE_GUARD = False
+BACKFILL_RATE_PAUSE_REASON = None
+
+
+class BackfillRateLimit(Exception):
+    """Raised before a request that would consume the configured reserve."""
+
+
+def update_strava_rate_guard(response):
+    """Record when the next Strava read should pause during a backfill."""
+    global BACKFILL_RATE_PAUSE_REASON
+    if not BACKFILL_RATE_GUARD:
+        return
+    limits = response.headers.get("X-ReadRateLimit-Limit")
+    usage = response.headers.get("X-ReadRateLimit-Usage")
+    if not limits or not usage:
+        return
+    try:
+        short_limit, daily_limit = (int(value) for value in limits.split(","))
+        short_usage, daily_usage = (int(value) for value in usage.split(","))
+    except (TypeError, ValueError):
+        return
+
+    short_reserve = int(os.environ.get("STRAVA_BACKFILL_15MIN_RESERVE", "10"))
+    daily_reserve = int(os.environ.get("STRAVA_BACKFILL_DAILY_RESERVE", "100"))
+    if daily_usage >= daily_limit - daily_reserve:
+        BACKFILL_RATE_PAUSE_REASON = (
+            f"daily read usage {daily_usage}/{daily_limit}; resume after midnight UTC"
+        )
+    elif short_usage >= short_limit - short_reserve:
+        BACKFILL_RATE_PAUSE_REASON = (
+            f"15-minute read usage {short_usage}/{short_limit}; resume after the next reset"
+        )
+
 def strava_request(method, url, access_token, retries=3, **kwargs):
     """Make an authenticated Strava API request with retry on 429/5xx."""
+    if BACKFILL_RATE_GUARD and BACKFILL_RATE_PAUSE_REASON:
+        raise BackfillRateLimit(BACKFILL_RATE_PAUSE_REASON)
     headers = {"Authorization": f"Bearer {access_token}"}
     for attempt in range(retries):
         resp = requests.request(method, url, headers=headers, **kwargs)
 
         if resp.status_code == 429:
+            if BACKFILL_RATE_GUARD:
+                raise BackfillRateLimit("Strava returned 429 Too Many Requests")
             # Rate limited — check Strava's rate limit reset header or back off
             wait = int(resp.headers.get("Retry-After", 60))
             print(f"    Rate limited. Waiting {wait}s...")
@@ -680,6 +751,7 @@ def strava_request(method, url, access_token, retries=3, **kwargs):
             time.sleep(wait)
             continue
 
+        update_strava_rate_guard(resp)
         return resp
 
     # Last attempt failed, raise
@@ -1139,6 +1211,285 @@ def sync(cfg, after_timestamp=None, dry_run=False, dedup_dawarich=False, dedup_r
     return gpx_files
 
 
+# ── Resumable historical backfill ───────────────────────────────────────────
+
+def save_json_atomic(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary, "w", encoding="utf-8") as output:
+        json.dump(payload, output, indent=2)
+    os.replace(temporary, path)
+
+
+def load_backfill_state():
+    if not BACKFILL_STATE_FILE.exists():
+        return None
+    with open(BACKFILL_STATE_FILE, encoding="utf-8") as state_file:
+        return json.load(state_file)
+
+
+def save_backfill_state(state):
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save_json_atomic(BACKFILL_STATE_FILE, state)
+
+
+def parse_backfill_date(value, end_of_range=False):
+    parsed = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    if end_of_range:
+        parsed += timedelta(days=1)
+    return int(parsed.timestamp())
+
+
+def dawarich_gpx_count(cfg, activity):
+    start = int(datetime.fromisoformat(activity["start_date"].replace("Z", "+00:00")).timestamp())
+    end = start + int(activity.get("elapsed_time", 0))
+    points = fetch_dawarich_points(cfg, start, end)
+    return sum(1 for point in points if is_dawarich_gpx_tracker(point.get("tracker_id")))
+
+
+def process_backfill_activity(cfg, access_token, activity):
+    """Complete one activity through upload and optional deduplication."""
+    activity_id = activity["id"]
+    activity_type = activity.get("type", "?")
+    if activity_type in NO_GPS_TYPES or not activity.get("start_latlng"):
+        print(f"    Skipped ({activity_type}: no GPS)")
+        return "no_gps"
+
+    existing_gpx = dawarich_gpx_count(cfg, activity)
+    if existing_gpx:
+        print(f"    Already present in Dawarich ({existing_gpx} GPX points)")
+        return "already_present"
+
+    streams = get_activity_streams(access_token, activity_id)
+    if not streams or "latlng" not in streams:
+        print("    Skipped (no Strava GPS stream)")
+        return "no_gps"
+
+    if activity_type in VIRTUAL_TYPES:
+        home = get_home_location(cfg)
+        if not home:
+            raise ValueError("HOME_LOCATION is required for virtual activities")
+        gpx_xml = build_gpx_relocated(activity, streams, *home)
+    else:
+        gpx_xml = build_gpx(activity, streams)
+    filepath = save_gpx(activity, gpx_xml)
+
+    # Dawarich was queried above and contains no GPX points. A local upload
+    # marker can therefore only represent an interrupted or failed import.
+    if filepath.name in load_import_state():
+        print(f"    Clearing orphaned upload marker for {filepath.name}")
+        clear_orphaned_upload_marker(filepath.name)
+
+    failures, uploaded_now = push_to_dawarich(cfg, [filepath])
+    if failures:
+        raise RuntimeError(f"Dawarich upload failed for activity {activity_id}")
+    if not uploaded_now:
+        raise RuntimeError(
+            f"Activity {activity_id} is locally marked uploaded but no GPX points exist in Dawarich"
+        )
+
+    auto_enabled = (
+        os.environ.get("DAWARICH_AUTO_DEDUP", "false").lower() in {"1", "true", "yes"}
+    )
+    if auto_enabled:
+        enqueue_auto_dedup(uploaded_now)
+        process_auto_dedup_queue(cfg)
+    return "imported"
+
+
+def run_backfill(cfg, date_from=None, date_to=None, batch_size=50, resume=False):
+    """Run a bounded, checkpointed historical import."""
+    global BACKFILL_RATE_GUARD, BACKFILL_RATE_PAUSE_REASON
+    existing = load_backfill_state()
+
+    if resume:
+        if not existing:
+            raise ValueError("No backfill state exists to resume")
+        state = existing
+        date_from = state["date_from"]
+        date_to = state["date_to"]
+        batch_size = int(state.get("batch_size", batch_size))
+    else:
+        if not date_from or not date_to:
+            raise ValueError("--from and --to are required for a new backfill")
+        if existing and existing.get("status") not in {"complete", "cancelled"}:
+            raise ValueError("An unfinished backfill exists; use --resume")
+        if parse_backfill_date(date_from) >= parse_backfill_date(date_to, end_of_range=True):
+            raise ValueError("Backfill start date must be before or equal to end date")
+        state = {
+            "version": 1,
+            "status": "active",
+            "date_from": date_from,
+            "date_to": date_to,
+            "batch_size": batch_size,
+            "completed_ids": [],
+            "counts": {
+                "imported": 0,
+                "already_present": 0,
+                "already_processed": 0,
+                "no_gps": 0,
+                "errors": 0,
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        save_backfill_state(state)
+
+    BACKFILL_RATE_GUARD = True
+    BACKFILL_RATE_PAUSE_REASON = None
+    try:
+        token = get_token(cfg)
+        access_token = token["access_token"]
+        after = parse_backfill_date(date_from)
+        before = parse_backfill_date(date_to, end_of_range=True)
+        activities = get_activities(access_token, after=after, before=before)
+        activities.sort(key=lambda activity: activity["start_date"])
+        completed = set(state.get("completed_ids", []))
+        fetched_ids = set(load_state().get("fetched_ids", []))
+        remaining = [activity for activity in activities if activity["id"] not in completed]
+        selected = remaining[:batch_size]
+
+        print(
+            f"Backfill {date_from} to {date_to}: {len(activities)} activities total, "
+            f"{len(remaining)} remaining, processing up to {len(selected)}"
+        )
+        for index, activity in enumerate(selected, 1):
+            activity_id = activity["id"]
+            print(
+                f"  [{index}/{len(selected)}] {activity['start_date'][:10]} - "
+                f"{activity.get('name', 'Unknown')} ({activity.get('type', '?')})"
+            )
+            if activity_id in fetched_ids:
+                result = "already_processed"
+                print("    Already processed by a previous sync")
+            else:
+                result = process_backfill_activity(cfg, access_token, activity)
+                fetched_ids.add(activity_id)
+                sync_state = load_state()
+                sync_state["fetched_ids"] = sorted(fetched_ids)
+                save_state(sync_state)
+
+            completed.add(activity_id)
+            state["completed_ids"] = sorted(completed)
+            state["counts"][result] = state["counts"].get(result, 0) + 1
+            state["last_activity_id"] = activity_id
+            state["status"] = "active"
+            state.pop("last_error", None)
+            save_backfill_state(state)
+
+        if len(remaining) <= len(selected):
+            state["status"] = "complete"
+            save_backfill_state(state)
+            print("Backfill complete.")
+        else:
+            print(f"Batch complete. {len(remaining) - len(selected)} activities remain; use --resume.")
+        print(f"Summary: {state['counts']}")
+        return state
+    except BackfillRateLimit as exc:
+        state["status"] = "paused_rate_limit"
+        state["last_error"] = str(exc)
+        save_backfill_state(state)
+        print(f"Backfill paused safely: {exc}")
+        return state
+    except Exception as exc:
+        state["status"] = "error"
+        state["counts"]["errors"] = state["counts"].get("errors", 0) + 1
+        state["last_error"] = str(exc)
+        save_backfill_state(state)
+        raise
+    finally:
+        BACKFILL_RATE_GUARD = False
+        BACKFILL_RATE_PAUSE_REASON = None
+
+
+def run_audit(cfg, batch_size=20, resume=False):
+    """Audit saved GPX activities against Dawarich without changing remote data."""
+    if resume:
+        if not AUDIT_STATE_FILE.exists():
+            raise ValueError("No audit state exists to resume")
+        with open(AUDIT_STATE_FILE, encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    else:
+        state = {
+            "version": 1,
+            "status": "active",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "completed_files": [],
+            "activities": [],
+        }
+
+    files = sorted(OUTPUT_DIR.glob("*.gpx"))
+    completed = set(state.get("completed_files", []))
+    remaining = [path for path in files if path.name not in completed]
+    selected = remaining[:batch_size]
+    allowed = configured_dedup_tracker_ids()
+    radius = int(os.environ.get("DAWARICH_DEDUP_RADIUS_METERS", "200"))
+
+    print(
+        f"Audit: {len(files)} local GPX files, {len(remaining)} remaining, "
+        f"checking up to {len(selected)}"
+    )
+    for index, gpx_path in enumerate(selected, 1):
+        activity, gpx_xml = activity_from_gpx_file(gpx_path)
+        print(f"  [{index}/{len(selected)}] {gpx_path.name}")
+        report = analyze_dawarich_overlap(
+            cfg, activity, gpx_xml, radius_meters=radius,
+            allowed_tracker_ids=allowed,
+        )
+        state["activities"].append({
+            "activity_id": activity["id"],
+            "filename": gpx_path.name,
+            "gpx_points": report["gpx_points_preserved"],
+            "dedup_candidates": len(report["candidate_points"]),
+            "tracker_summary": report["tracker_summary"],
+            "candidate_tracker_counts": dict(sorted(
+                {
+                    tracker: sum(
+                        1 for candidate in report["candidate_points"]
+                        if candidate.get("tracker_id") == tracker
+                    )
+                    for tracker in allowed
+                }.items()
+            )),
+        })
+        completed.add(gpx_path.name)
+        state["completed_files"] = sorted(completed)
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        save_json_atomic(AUDIT_STATE_FILE, state)
+
+    totals = {
+        "local_gpx_files": len(files),
+        "audited_activities": len(state["activities"]),
+        "activities_missing_in_dawarich": sum(
+            1 for item in state["activities"] if item["gpx_points"] == 0
+        ),
+        "activities_with_candidates": sum(
+            1 for item in state["activities"] if item["dedup_candidates"] > 0
+        ),
+        "dedup_candidates": sum(
+            item["dedup_candidates"] for item in state["activities"]
+        ),
+        "observed_tracker_points": {},
+    }
+    for item in state["activities"]:
+        for tracker, count in item.get("tracker_summary", {}).items():
+            totals["observed_tracker_points"][tracker] = (
+                totals["observed_tracker_points"].get(tracker, 0) + count
+            )
+    totals["observed_tracker_points"] = dict(
+        sorted(totals["observed_tracker_points"].items())
+    )
+    state["totals"] = totals
+    state["status"] = "complete" if len(remaining) <= len(selected) else "active"
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save_json_atomic(AUDIT_STATE_FILE, state)
+    save_json_atomic(AUDIT_REPORT_FILE, state)
+    print(f"Audit status: {state['status']}")
+    print(f"Summary: {totals}")
+    print(f"Report: {AUDIT_REPORT_FILE}")
+    return state
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -1177,6 +1528,28 @@ def parse_args():
         help="Exact Strava activity ID required to authorize deletion",
     )
 
+    backfill_parser = sub.add_parser(
+        "backfill", help="Import a bounded historical period with checkpoints"
+    )
+    backfill_parser.add_argument("--from", dest="date_from", help="Start date (YYYY-MM-DD)")
+    backfill_parser.add_argument("--to", dest="date_to", help="End date, inclusive (YYYY-MM-DD)")
+    backfill_parser.add_argument(
+        "--batch-size", type=int, default=50, help="Maximum activities per invocation (default: 50)"
+    )
+    backfill_parser.add_argument(
+        "--resume", action="store_true", help="Resume the existing checkpointed backfill"
+    )
+
+    audit_parser = sub.add_parser(
+        "audit", help="Audit local GPX imports and legacy overlap without deleting points"
+    )
+    audit_parser.add_argument(
+        "--batch-size", type=int, default=20, help="Maximum GPX files per invocation"
+    )
+    audit_parser.add_argument(
+        "--resume", action="store_true", help="Resume the existing audit checkpoint"
+    )
+
     return parser.parse_args()
 
 
@@ -1203,10 +1576,6 @@ def main():
         if args.dedup_dawarich and not cfg.get("dawarich_url"):
             print("Dawarich must be configured for --dedup-dawarich.")
             sys.exit(2)
-        if args.dedup_dawarich and not os.environ.get("DAWARICH_DEDUP_TRACKER_IDS", "").strip():
-            print("Set DAWARICH_DEDUP_TRACKER_IDS to the tracker IDs allowed for deduplication.")
-            sys.exit(2)
-
         after = None
         if args.all:
             after = 0
@@ -1284,8 +1653,48 @@ def main():
         print(f"Deduplication complete: {deleted} legacy Dawarich points deleted.")
         return
 
+    if args.command == "backfill":
+        cfg = load_config()
+        if not cfg.get("dawarich_url") or not cfg.get("dawarich_api_key"):
+            print("Dawarich must be configured for backfill.")
+            sys.exit(2)
+        if args.batch_size < 1:
+            print("--batch-size must be at least 1.")
+            sys.exit(2)
+        try:
+            state = run_backfill(
+                cfg,
+                date_from=args.date_from,
+                date_to=args.date_to,
+                batch_size=args.batch_size,
+                resume=args.resume,
+            )
+        except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
+            print(f"Backfill failed safely: {exc}")
+            print(f"Checkpoint: {BACKFILL_STATE_FILE}")
+            sys.exit(1)
+        if state.get("status") == "paused_rate_limit":
+            print("Run the same command with --resume after the indicated reset.")
+        return
+
+    if args.command == "audit":
+        cfg = load_config()
+        if not cfg.get("dawarich_url") or not cfg.get("dawarich_api_key"):
+            print("Dawarich must be configured for audit.")
+            sys.exit(2)
+        if args.batch_size < 1:
+            print("--batch-size must be at least 1.")
+            sys.exit(2)
+        try:
+            run_audit(cfg, batch_size=args.batch_size, resume=args.resume)
+        except (OSError, ValueError, requests.RequestException) as exc:
+            print(f"Audit failed safely: {exc}")
+            print(f"Checkpoint: {AUDIT_STATE_FILE}")
+            sys.exit(1)
+        return
+
     # No command given
-    print("Usage: python strava_gpx.py {setup|auth|sync|push|dedup}")
+    print("Usage: python strava_gpx.py {setup|auth|sync|push|dedup|backfill|audit}")
     print("Run with --help for details.")
 
 

@@ -26,9 +26,13 @@ class DeduplicationTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         app.STATE_DIR = self.root / "state"
+        app.STATE_FILE = app.STATE_DIR / "state.json"
         app.OUTPUT_DIR = self.root / "gpx"
         app.IMPORT_STATE_FILE = app.STATE_DIR / "dawarich_imports.json"
         app.AUTO_DEDUP_QUEUE_FILE = app.STATE_DIR / "auto_dedup_queue.json"
+        app.BACKFILL_STATE_FILE = app.STATE_DIR / "backfill_state.json"
+        app.AUDIT_STATE_FILE = app.STATE_DIR / "audit_state.json"
+        app.AUDIT_REPORT_FILE = app.STATE_DIR / "audit-report.json"
         app.DEDUP_REPORT_DIR = app.STATE_DIR / "dedup-reports"
         app.OUTPUT_DIR.mkdir()
 
@@ -87,7 +91,9 @@ class DeduplicationTests(unittest.TestCase):
             {"id": 1, "lat": 46.8001, "lng": -71.2001, "tracker_id": "D5"},
             {"id": 2, "lat": 46.9000, "lng": -71.3000, "tracker_id": "D5"},
             {"id": 3, "lat": 46.8001, "lng": -71.2001, "tracker_id": "gpx-import"},
-            {"id": 4, "lat": 46.8001, "lng": -71.2001, "tracker_id": "OTHER"},
+            {"id": 4, "lat": 46.8001, "lng": -71.2001,
+             "tracker_id": "import-619-trk-0-seg-0"},
+            {"id": 5, "lat": 46.8001, "lng": -71.2001, "tracker_id": "OTHER"},
         ]
 
         with patch.object(app, "fetch_dawarich_points", return_value=points):
@@ -97,7 +103,7 @@ class DeduplicationTests(unittest.TestCase):
 
         self.assertEqual([point["id"] for point in report["candidate_points"]], [1])
         self.assertEqual(report["outside_corridor"], 1)
-        self.assertEqual(report["gpx_points_preserved"], 1)
+        self.assertEqual(report["gpx_points_preserved"], 2)
         self.assertEqual(report["unapproved_tracker_points_preserved"], 1)
         self.assertTrue((app.DEDUP_REPORT_DIR / "strava-42.json").exists())
 
@@ -177,12 +183,21 @@ class DeduplicationTests(unittest.TestCase):
             "start_date": "2026-08-14T12:00:00Z",
             "elapsed_time": 60,
         }
-        points = [{"tracker_id": "gpx-import"}, {"tracker_id": "D5"}]
+        points = [
+            {"tracker_id": "import-619-trk-0-seg-0"},
+            {"tracker_id": "D5"},
+        ]
 
         with patch.object(app, "fetch_dawarich_points", return_value=points):
             count = app.wait_for_dawarich_gpx({}, activity, timeout_seconds=0)
 
         self.assertEqual(count, 1)
+
+    def test_only_dawarich_import_trackers_are_treated_as_gpx(self):
+        self.assertTrue(app.is_dawarich_gpx_tracker("gpx-abc-trk-0-seg-0"))
+        self.assertTrue(app.is_dawarich_gpx_tracker("import-619-trk-0-seg-0"))
+        self.assertFalse(app.is_dawarich_gpx_tracker("google-phone-1"))
+        self.assertFalse(app.is_dawarich_gpx_tracker("imported-phone"))
 
     def test_auto_dedup_verifies_after_deletion(self):
         gpx_path = self.root / "2026-08-14_42_Test.gpx"
@@ -195,7 +210,8 @@ class DeduplicationTests(unittest.TestCase):
         }
         candidate = {"id": 1, "tracker_id": "D5", "original_point": {"id": 1}}
 
-        with patch.object(app, "activity_from_gpx_file", return_value=(activity, "<gpx />")), \
+        with patch.dict(app.os.environ, {"DAWARICH_DEDUP_TRACKER_IDS": "D5"}), \
+                patch.object(app, "activity_from_gpx_file", return_value=(activity, "<gpx />")), \
                 patch.object(app, "wait_for_dawarich_gpx"), \
                 patch.object(
                     app,
@@ -207,6 +223,11 @@ class DeduplicationTests(unittest.TestCase):
 
         delete.assert_called_once()
         self.assertEqual(analyze.call_count, 2)
+
+    def test_auto_dedup_requires_explicit_tracker_allowlist(self):
+        with patch.dict(app.os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "safety allowlist"):
+                app.auto_dedup_uploaded_files({}, [])
 
     def test_auto_dedup_queue_is_removed_only_after_success(self):
         gpx_path = app.OUTPUT_DIR / "2026-08-14_42_Test.gpx"
@@ -221,6 +242,100 @@ class DeduplicationTests(unittest.TestCase):
         with patch.object(app, "auto_dedup_uploaded_files"):
             app.process_auto_dedup_queue({})
         self.assertEqual(app.load_auto_dedup_queue(), [])
+
+    def test_backfill_checkpoints_each_activity_and_resumes(self):
+        activities = [
+            {"id": value, "start_date": f"2024-01-0{value}T12:00:00Z", "name": str(value)}
+            for value in (1, 2, 3)
+        ]
+        app.save_state({"fetched_ids": [1]})
+
+        with patch.object(app, "get_token", return_value={"access_token": "token"}), \
+                patch.object(app, "get_activities", return_value=activities), \
+                patch.object(app, "process_backfill_activity", return_value="imported") as process:
+            first = app.run_backfill(
+                {}, date_from="2024-01-01", date_to="2024-01-31", batch_size=2
+            )
+            second = app.run_backfill({}, resume=True)
+
+        self.assertEqual(first["status"], "active")
+        self.assertEqual(second["status"], "complete")
+        self.assertEqual(second["completed_ids"], [1, 2, 3])
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual(app.load_state()["fetched_ids"], [1, 2, 3])
+
+    def test_rate_guard_preserves_configured_reserve(self):
+        response = types.SimpleNamespace(
+            headers={
+                "X-ReadRateLimit-Limit": "100,1000",
+                "X-ReadRateLimit-Usage": "90,500",
+            }
+        )
+        app.BACKFILL_RATE_GUARD = True
+        app.BACKFILL_RATE_PAUSE_REASON = None
+        try:
+            app.update_strava_rate_guard(response)
+            with self.assertRaises(app.BackfillRateLimit):
+                app.strava_request("GET", "https://example.test", "token")
+        finally:
+            app.BACKFILL_RATE_GUARD = False
+            app.BACKFILL_RATE_PAUSE_REASON = None
+
+    def test_backfill_reuploads_when_local_marker_has_no_dawarich_points(self):
+        activity = {
+            "id": 5270485334,
+            "name": "Lunch Hike",
+            "type": "Hike",
+            "start_date": "2021-05-09T12:00:00Z",
+            "elapsed_time": 60,
+            "start_latlng": [46.8, -71.2],
+        }
+        streams = {"latlng": [[46.8, -71.2]], "time": [0]}
+        filename = "2021-05-09_5270485334_Lunch Hike.gpx"
+        app.save_import_state({filename})
+        app.save_auto_dedup_queue([filename])
+
+        def successful_reupload(cfg, paths):
+            self.assertNotIn(filename, app.load_import_state())
+            self.assertNotIn(filename, app.load_auto_dedup_queue())
+            return 0, paths
+
+        with patch.object(app, "dawarich_gpx_count", return_value=0), \
+                patch.object(app, "get_activity_streams", return_value=streams), \
+                patch.object(app, "push_to_dawarich", side_effect=successful_reupload), \
+                patch.dict(app.os.environ, {"DAWARICH_AUTO_DEDUP": "false"}):
+            result = app.process_backfill_activity({}, "token", activity)
+
+        self.assertEqual(result, "imported")
+
+    def test_audit_is_checkpointed_and_resumable(self):
+        for activity_id in (41, 42):
+            path = app.OUTPUT_DIR / f"2026-08-14_{activity_id}_Test.gpx"
+            path.write_text(
+                '<gpx><metadata><time>2026-08-14T12:00:00Z</time></metadata>'
+                '<trk><trkseg><trkpt lat="46.8" lon="-71.2">'
+                '<time>2026-08-14T12:01:00Z</time></trkpt></trkseg></trk></gpx>',
+                encoding="utf-8",
+            )
+        reports = [
+            {"gpx_points_preserved": 10, "tracker_summary": {"gpx-a": 10, "D5": 1},
+             "candidate_points": [
+                {"tracker_id": "D5"}
+            ]},
+            {"gpx_points_preserved": 0, "tracker_summary": {}, "candidate_points": []},
+        ]
+        with patch.dict(app.os.environ, {"DAWARICH_DEDUP_TRACKER_IDS": "D5,google-phone-1"}), \
+                patch.object(app, "analyze_dawarich_overlap", side_effect=reports):
+            first = app.run_audit({}, batch_size=1)
+            second = app.run_audit({}, batch_size=1, resume=True)
+
+        self.assertEqual(first["status"], "active")
+        self.assertEqual(second["status"], "complete")
+        self.assertEqual(second["totals"]["audited_activities"], 2)
+        self.assertEqual(second["totals"]["activities_missing_in_dawarich"], 1)
+        self.assertEqual(second["totals"]["dedup_candidates"], 1)
+        self.assertEqual(second["totals"]["observed_tracker_points"]["D5"], 1)
+        self.assertTrue(app.AUDIT_REPORT_FILE.exists())
 
 
 if __name__ == "__main__":
