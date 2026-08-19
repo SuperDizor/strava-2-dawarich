@@ -262,6 +262,33 @@ class DeduplicationTests(unittest.TestCase):
             app.BACKFILL_RATE_GUARD = False
             app.BACKFILL_RATE_PAUSE_REASON = None
 
+    def test_backfill_reuploads_when_local_marker_has_no_dawarich_points(self):
+        activity = {
+            "id": 5270485334,
+            "name": "Lunch Hike",
+            "type": "Hike",
+            "start_date": "2021-05-09T12:00:00Z",
+            "elapsed_time": 60,
+            "start_latlng": [46.8, -71.2],
+        }
+        streams = {"latlng": [[46.8, -71.2]], "time": [0]}
+        filename = "2021-05-09_5270485334_Lunch Hike.gpx"
+        app.save_import_state({filename})
+        app.save_auto_dedup_queue([filename])
+
+        def successful_reupload(cfg, paths):
+            self.assertNotIn(filename, app.load_import_state())
+            self.assertNotIn(filename, app.load_auto_dedup_queue())
+            return 0, paths
+
+        with patch.object(app, "dawarich_gpx_count", return_value=0), \
+                patch.object(app, "get_activity_streams", return_value=streams), \
+                patch.object(app, "push_to_dawarich", side_effect=successful_reupload), \
+                patch.dict(app.os.environ, {"DAWARICH_AUTO_DEDUP": "false"}):
+            result = app.process_backfill_activity({}, "token", activity)
+
+        self.assertEqual(result, "imported")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -208,6 +208,18 @@ def save_import_state(uploaded_files):
         json.dump({"uploaded_files": sorted(uploaded_files)}, f, indent=2)
 
 
+def clear_orphaned_upload_marker(filename):
+    """Allow a verified-missing GPX to be uploaded again on backfill resume."""
+    uploaded_files = load_import_state()
+    uploaded_files.discard(filename)
+    save_import_state(uploaded_files)
+
+    queue = load_auto_dedup_queue()
+    if filename in queue:
+        queue.remove(filename)
+        save_auto_dedup_queue(queue)
+
+
 # ── Dawarich deduplication preview ──────────────────────────────────────────
 
 def haversine_meters(lat1, lon1, lat2, lon2):
@@ -1243,6 +1255,12 @@ def process_backfill_activity(cfg, access_token, activity):
     else:
         gpx_xml = build_gpx(activity, streams)
     filepath = save_gpx(activity, gpx_xml)
+
+    # Dawarich was queried above and contains no GPX points. A local upload
+    # marker can therefore only represent an interrupted or failed import.
+    if filepath.name in load_import_state():
+        print(f"    Clearing orphaned upload marker for {filepath.name}")
+        clear_orphaned_upload_marker(filepath.name)
 
     failures, uploaded_now = push_to_dawarich(cfg, [filepath])
     if failures:

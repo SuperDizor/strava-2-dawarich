@@ -217,6 +217,11 @@ pauses before consuming `STRAVA_BACKFILL_15MIN_RESERVE` or
 `STRAVA_BACKFILL_DAILY_RESERVE`; resume after the indicated reset. This avoids
 using the request capacity needed by normal scheduled syncs.
 
+If an interrupted import left a filename in the local upload registry but
+Dawarich exposes no GPX points in that activity window, `--resume` clears the
+orphaned marker and re-uploads the file. This recovery happens only after a
+complete Dawarich point query confirms the GPX is absent.
+
 ## Automating with Cron (Unraid User Scripts)
 
 Add a User Script on Unraid to sync on a schedule:
